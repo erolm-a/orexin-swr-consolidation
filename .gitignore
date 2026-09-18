@@ -213,9 +213,7 @@ tags
 .vscode/
 .ipython/
 cluster/
-data/
-plots/
-scratch/
+
 
 # Ignore all pngs generated on the root folder
 *.png
@@ -226,5 +224,12 @@ outputs/
 .jaxcache/
 .dingo_benchmark_cache/
 
-# and also zips
+# and also zips or specific artifacts
 *.zip
+
+data_raw/
+*.lfp
+*.eeg
+*.dat
+*.xml
+*.mat

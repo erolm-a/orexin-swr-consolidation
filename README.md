@@ -108,11 +108,11 @@ python orexin_paths.py          # root in use + artefact versions
 
 
 ```bash
-python scripts/00_migrate_filenames.py   # once, if migrating an old directory
-python scripts/01_swr_detection.py       # ~[X] min; requires data_raw/
-python scripts/02_synthetic_generator.py # ~[X] min
-python scripts/03_agent_model.py         # ~[X] h
-python scripts/04_figures.py             # writes figures/
+python 00_migrate_filenames.py   # once, if migrating an old directory
+python 01_swr_detection.py       # ~[X] min; requires data_raw/
+python 02_synthetic_generator.py # ~[X] min
+python 03_agent_model.py         # ~[X] h
+python 04_figures.py             # writes figures/
 ```
 
 Stages 2–4 are seeded (`seed=1234` for calibration, common random numbers across

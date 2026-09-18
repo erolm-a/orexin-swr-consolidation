@@ -1,0 +1,18 @@
+# Runtime dependencies for the orexin-SWR consolidation model.
+# Versions are lower bounds matching the Colab environment the results were
+# produced in; pin exactly (==) before archiving a release to Zenodo.
+
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+matplotlib>=3.7
+seaborn>=0.13
+tqdm>=4.66
+mat73>=0.60          # reads MATLAB v7.3 sleep-state annotation files (CRCNS)
+python-docx>=1.1     # table1_to_word.py only
+
+# Notes
+# -----
+# torch is imported in the original Cell 3 but never used; omitted deliberately.
+# ripple_detection, pynwb and scikit-learn appear in the Cell 2 install line but
+# are never imported anywhere in the pipeline; omitted deliberately.
