@@ -20,17 +20,28 @@ Code accompanying: *[manuscript title]*, [authors], [year]. `[DOI or preprint li
 orexin-swr-consolidation/
 ├── orexin_paths.py            # paths + artefact versions, single source of truth
 ├── requirements.txt
-├── scripts/
-│   ├── 00_migrate_filenames.py     # one-time rename of legacy versioned pickles
-│   ├── 01_swr_detection.py         # detector  → swr_detection.pkl
-│   ├── 02_synthetic_generator.py   # generator → synthetic_libraries.pkl
-│   ├── 03_agent_model.py           # agent     → agent_model_results.pkl
-│   └── 04_figures.py               # Figures 1–5 + supplementary
+├── pyproject.toml             # uv-managed metadata (deps mirror requirements.txt)
+├── common/                    # shared helpers extracted from the pipeline scripts
+│   ├── paths.py               #   setup(): DIRS/FILES/PROJECT_ROOT/VERSIONS/load_artifact
+│   ├── utils.py               #   ox_key, bandpass, pooling, NaN-safe summarisers
+│   ├── stats.py               #   curvature/peak/bootstrap statistics (Stage 3 → 4)
+│   └── plotting.py            #   plabel / panel_label / save_and_show
+├── 00_migrate_filenames.py     # one-time rename of legacy versioned pickles
+├── 01_swr_detection.py         # detector  → swr_detection.pkl
+├── 02_synthetic_generator.py   # generator → synthetic_libraries.pkl
+├── 03_agent_model.py           # agent     → agent_model_results.pkl
+├── 04_figures.py               # Figures 1–5 + supplementary
+├── *_refactored.py             # leaner copies importing the shared common/ helpers
 ├── analysis/
 │   └── build_table1_calibration.py
 └── tests/
     └── test_model.py
 ```
+
+The `01_…_refactored.py` … `04_figures_refactored.py` / `analysis/build_table1_calibration_refactored.py`
+copies are behaviourally identical rewrites that import the duplicated helpers from `common/`; the
+originals remain the code of record. `common/paths.setup()` replaces the per-script
+`sys.path`/`orexin_paths` boilerplate in every copy.
 
 Generated artefacts (`data_processed/`, `models/`, `results/`, `figures/`,
 `tables/`) are git-ignored and recreated by running the scripts in order.
@@ -45,9 +56,11 @@ either of us noticing.
 ```bash
 git clone https://github.com/<user>/orexin-swr-consolidation.git
 cd orexin-swr-consolidation
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+uv sync            # creates .venv + installs the deps in pyproject.toml
 ```
+
+(or `uv sync --no-dev` for a plain run). The deps repeat `requirements.txt`; `pip install -r
+requirements.txt` still works if you prefer not to use uv.
 
 Tested on Python 3.11. Plain Python throughout — no notebook runtime, no cloud
 storage, no machine-specific paths.
@@ -80,7 +93,7 @@ import os
 os.environ['OREXIN_PROJECT_ROOT'] = '/content/drive/MyDrive/orexin_spw_r_project'
 
 !pip install -q -r requirements.txt
-!python scripts/04_figures.py
+!python 04_figures.py
 ```
 </details>
 
@@ -140,7 +153,7 @@ artefact. Any script that then loads a stale pickle fails immediately rather
 than silently producing a figure from the wrong data.
 
 If you have an existing project directory with the old versioned filenames, run
-`python scripts/00_migrate_filenames.py --dry-run` first, then without the flag.
+`python 00_migrate_filenames.py --dry-run` first, then without the flag.
 
 ## Citation
 
