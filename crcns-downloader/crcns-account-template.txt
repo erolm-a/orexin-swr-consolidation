@@ -1,0 +1,7 @@
+# This file is initially named "crcns-account-template.txt".
+# To use it, rename the file "crcns-account.txt" (remove the '-template').
+# Then edit the lines below to specify your CRCNS.org account information
+# by inserting the username and password between the single quotes.
+crcns_username=''
+crcns_password=''
+

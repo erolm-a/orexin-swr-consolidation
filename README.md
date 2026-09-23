@@ -10,8 +10,11 @@ OX2R-specific effects on SWR statistics shape replay and event-level plasticity.
 Consolidation-dominant learning yields a non-monotonic (band-pass) performance
 curve with an interior optimum whose location shifts with task complexity.
 
-Code accompanying: *[manuscript title]*, [authors], [year]. `[DOI or preprint link]`
+Code accompanying: *[manuscript title]*, Shakleina and Trombetta, 2026. `[DOI or preprint link]`
 
+Note: the code has been largely co-written by AI models and manually tested on Linux systems (Ubuntu on Google Colab, NixOS 25.05) and using Python 3.11; while no OS-specific feature is used, we recommend running this code on similar platforms.
+
+<!--
 ---
 
 ## Repository layout
@@ -51,6 +54,8 @@ included: keeping a parallel copy invites the two to drift, and a reviewer who
 ran the notebook instead of the scripts could get different numbers without
 either of us noticing.
 
+-->
+
 ## Installation
 
 ```bash
@@ -59,11 +64,7 @@ cd orexin-swr-consolidation
 uv sync            # creates .venv + installs the deps in pyproject.toml
 ```
 
-(or `uv sync --no-dev` for a plain run). The deps repeat `requirements.txt`; `pip install -r
-requirements.txt` still works if you prefer not to use uv.
-
-Tested on Python 3.11. Plain Python throughout — no notebook runtime, no cloud
-storage, no machine-specific paths.
+The deps repeat `requirements.txt`; `pip install -r requirements.txt` still works if you prefer not to use uv.
 
 ### Where the data lives
 
@@ -99,17 +100,25 @@ os.environ['OREXIN_PROJECT_ROOT'] = '/content/drive/MyDrive/orexin_spw_r_project
 
 ## Data availability
 
-Local field potentials come from the CRCNS `hc-[XX]` dataset
-(Girardeau et al., 2017), NREM/Intermediate epochs of three POST sessions:
-`Achilles_10252013`, `Cicero_09102014`, `Cicero_09172014`.
+Local field potentials come from the CRCNS `hc-11` dataset
+(Girardeau et al., 2017), NREM/Intermediate epochs of all POST sessions, along with their metadata.
 
 **These recordings are not redistributed here.** They must be downloaded from
 [crcns.org](https://crcns.org) under the CRCNS data-use terms and placed in
-`data_raw/<session_name>/`. Everything downstream is reproducible from them.
+`data_raw/<session_name>/`.
 
+
+Before you start, you **must create an account on CRCNS**, and write the credentials on the
+protected file `crcns-account.txt`. Then, **launch the script `00_datasets.py`** that will
+automatically download and extract the required files. Bear in mind **this operation will download around 24GBs and
+expand up to 150GBs**. If running on Linux systems we suggest mounting an external drive onto
+`data_raw`. If running on Google Colab your only external storage would be your Google Drive.
+
+<!--
 Derived artefacts (detector output, synthetic libraries, confirmed results) are
 archived at `[Zenodo DOI]` for reviewers who want to reproduce the figures
 without re-running the detection stage.
+-->
 
 ## Reproducing the results
 
@@ -121,7 +130,7 @@ python orexin_paths.py          # root in use + artefact versions
 
 
 ```bash
-python 00_migrate_filenames.py   # once, if migrating an old directory
+python 00_datasets.py            # Did you read the paragraph above?
 python 01_swr_detection.py       # ~[X] min; requires data_raw/
 python 02_synthetic_generator.py # ~[X] min
 python 03_agent_model.py         # ~[X] h
@@ -161,5 +170,11 @@ See `CITATION.cff`.
 
 ## License
 
-Code released under the MIT License (`LICENSE`). CRCNS recordings remain subject
+Code released under the MIT License (see `LICENSE`).
+
+The downloader script relies on `crcns-downloader` (hereby distributed for convenience) by Jeff Teeters, which is
+also released under MIT license. CRCNS recordings remain subject
 to their own terms and are not covered by this license.
+ 
+Copyrights for Google, MATLAB, Python etc. belong to their respective companies or organizations.
+
