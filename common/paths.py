@@ -3,12 +3,12 @@ common.paths — one import to set up project paths in every pipeline script.
 
 Use:
     from common.paths import setup
-    DIRS, FILES, PROJECT_ROOT, VERSIONS, load_artifact = setup()
+    DIRS, FILES, PROJECT_ROOT, PIPELINE_VERSION, load_artifact = setup()
 
-Replaces the duplicated sys.path / orexin_paths boilerplate that used to open
-every script. ``common`` lives at the repository root; root-level scripts are
-launched with the repo directory on sys.path, so ``import common`` resolves
-without configuration.
+The pipeline scripts import from ``orexin_paths`` directly; this module is the
+convenience form for anything that only needs the path tables. ``common`` lives
+at the repository root, and root-level scripts are launched with the repo
+directory on sys.path, so ``import common`` resolves without configuration.
 """
 
 import sys
@@ -23,25 +23,26 @@ if str(_PROJECT_ROOT) not in sys.path:
 from orexin_paths import (  # noqa: E402
     DIRS,
     FILES,
+    PIPELINE_VERSION,
     PROJECT_ROOT,
-    VERSIONS,
     check_version,
     ensure_dirs,
     find_file,
     load_artifact,
     stamp,
 )
+from orexin_keys import ox_key  # noqa: E402
 
 
 def setup():
     """
     Create the artefact directory tree and return the shared path tables.
 
-    Call this at the top of every pipeline script:
-        DIRS, FILES, PROJECT_ROOT, VERSIONS, load_artifact = setup()
+    Call this at the top of a script that needs nothing else from orexin_paths:
+        DIRS, FILES, PROJECT_ROOT, PIPELINE_VERSION, load_artifact = setup()
     """
     ensure_dirs()
-    return DIRS, FILES, PROJECT_ROOT, VERSIONS, load_artifact
+    return DIRS, FILES, PROJECT_ROOT, PIPELINE_VERSION, load_artifact
 
 
 __all__ = [
@@ -49,10 +50,11 @@ __all__ = [
     "DIRS",
     "FILES",
     "PROJECT_ROOT",
-    "VERSIONS",
+    "PIPELINE_VERSION",
     "ensure_dirs",
     "load_artifact",
     "find_file",
     "stamp",
     "check_version",
+    "ox_key",
 ]

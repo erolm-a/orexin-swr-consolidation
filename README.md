@@ -21,33 +21,51 @@ Note: the code has been largely co-written by AI models and manually tested on L
 
 ```
 orexin-swr-consolidation/
-├── orexin_paths.py            # paths + artefact versions, single source of truth
+├── orexin_paths.py            # paths + artefact identity, single source of truth
+├── orexin_keys.py             # canonical library key formatter (ox_key / library_key)
 ├── requirements.txt
 ├── pyproject.toml             # uv-managed metadata (deps mirror requirements.txt)
-├── common/                    # shared helpers extracted from the pipeline scripts
-│   ├── paths.py               #   setup(): DIRS/FILES/PROJECT_ROOT/VERSIONS/load_artifact
-│   ├── utils.py               #   ox_key, bandpass, pooling, NaN-safe summarisers
+├── common/                    # shared helpers used across the pipeline
+│   ├── paths.py               #   setup(): DIRS/FILES/PROJECT_ROOT/PIPELINE_VERSION/load_artifact
+│   ├── utils.py               #   ox_key, bandpass, seeding, pooling, NaN-safe summarisers
 │   ├── stats.py               #   curvature/peak/bootstrap statistics (Stage 3 → 4)
 │   └── plotting.py            #   plabel / panel_label / save_and_show
-├── 00_migrate_filenames.py     # one-time rename of legacy versioned pickles
-├── 01_swr_detection.py         # detector  → swr_detection.pkl
-├── 02_synthetic_generator.py   # generator → synthetic_libraries.pkl
-├── 03_agent_model.py           # agent     → agent_model_results.pkl
-├── 04_figures.py               # Figures 1–5 + supplementary
-├── *_refactored.py             # leaner copies importing the shared common/ helpers
+├── 00_datasets.py             # CRCNS hc-11 download + extract -> data_raw/
+├── scripts/
+│   ├── 00_migrate.py          # one-time rename of legacy versioned pickles
+│   ├── 01_swr_detection.py    # LFP     -> data_processed/swr_detection.pkl
+│   ├── 02_synthetic_libraries.py  # events -> models/synthetic_libraries.pkl
+│   ├── 03_agent_model.py      # libraries -> results/agent_model_results.pkl
+│   └── figures/               # one script per figure, each standalone
+│       ├── figure_1_swr_detection.py
+│       ├── figure_2_library_validation.py
+│       ├── figure_3_nonmonotonic.py
+│       ├── figure_4_limb_mechanisms.py
+│       ├── figure_5_task_complexity.py
+│       ├── figure_s1_replay_truncation.py
+│       ├── figure_s2_learning_rule.py
+│       └── figure_s3_seed_spread.py
 ├── analysis/
-│   └── build_table1_calibration.py
+│   ├── detector_validation.py      # example events, distribution checks
+│   ├── library_validation.py       # synthetic against empirical
+│   ├── table1_calibration.py       # Table 1
+│   ├── dissociation_interaction.py # formal encoding/consolidation test
+│   ├── learning_rule_control.py    # Supplementary Figure 2 control
+│   └── check_learning_rule_control.py
 └── tests/
     └── test_model.py
 ```
 
-The `01_…_refactored.py` … `04_figures_refactored.py` / `analysis/build_table1_calibration_refactored.py`
-copies are behaviourally identical rewrites that import the duplicated helpers from `common/`; the
-originals remain the code of record. `common/paths.setup()` replaces the per-script
-`sys.path`/`orexin_paths` boilerplate in every copy.
+Every script runs standalone: each reloads the artefacts it needs and assumes no
+state from any other. The figure scripts each carry their own styling helpers,
+so a reviewer can run one figure without running the rest. Where a helper is
+genuinely shared — the key formatter, the band-pass filter, the seeding rule,
+trial pooling — it lives in `orexin_keys.py` or `common/` and is imported rather
+than copied.
 
-Generated artefacts (`data_processed/`, `models/`, `results/`, `figures/`,
-`tables/`) are git-ignored and recreated by running the scripts in order.
+Generated artefacts (`data_raw/`, `data_processed/`, `models/`, `results/`,
+`figures/`, `tables/`, `checkpoints/`) are git-ignored and recreated by running
+the scripts in order.
 
 The scripts are the code of record. The original notebook is deliberately not
 included: keeping a parallel copy invites the two to drift, and a reviewer who
@@ -94,7 +112,7 @@ import os
 os.environ['OREXIN_PROJECT_ROOT'] = '/content/drive/MyDrive/orexin_spw_r_project'
 
 !pip install -q -r requirements.txt
-!python 04_figures.py
+!python scripts/figures/figure_3_nonmonotonic.py
 ```
 </details>
 
@@ -113,6 +131,7 @@ protected file `crcns-account.txt`. Then, **launch the script `00_datasets.py`**
 automatically download and extract the required files. Bear in mind **this operation will download around 24GBs and
 expand up to 150GBs**. If running on Linux systems we suggest mounting an external drive onto
 `data_raw`. If running on Google Colab your only external storage would be your Google Drive.
+Please make sure to run the script **from the project root folder**.
 
 <!--
 Derived artefacts (detector output, synthetic libraries, confirmed results) are
@@ -130,39 +149,59 @@ python orexin_paths.py          # root in use + artefact versions
 
 
 ```bash
-python 00_datasets.py            # Did you read the paragraph above?
-python 01_swr_detection.py       # ~[X] min; requires data_raw/
-python 02_synthetic_generator.py # ~[X] min
-python 03_agent_model.py         # ~[X] h
-python 04_figures.py             # writes figures/
+python scripts/00_datasets.py            # Did you read the paragraph above?
+python scripts/01_swr_detection.py   # requires data_raw/
+python scripts/02_synthetic_libraries.py
+python scripts/03_agent_model.py
+
+python scripts/figures/figure_1_swr_detection.py
+python scripts/figures/figure_2_library_validation.py
+python scripts/figures/figure_3_nonmonotonic.py
+python scripts/figures/figure_4_limb_mechanisms.py
+python scripts/figures/figure_5_task_complexity.py
+python scripts/figures/figure_s1_replay_truncation.py
+python scripts/figures/figure_s3_seed_spread.py
+
+python analysis/table1_calibration.py
+python analysis/dissociation_interaction.py
+```
+
+Optional checks: `analysis/detector_validation.py` after stage 1,
+`analysis/library_validation.py` after stage 2. Supplementary Figure 2 needs the
+control run first:
+
+```bash
+python analysis/learning_rule_control.py --validate
+python scripts/figures/figure_s2_learning_rule.py
 ```
 
 Stages 2–4 are seeded (`seed=1234` for calibration, common random numbers across
 OX2R levels) and reproduce the reported values exactly on the same NumPy version.
 
 To reproduce only the figures from the archived results, download the Zenodo
-artefacts into `models/` and `results/` and run stage 04 alone.
+artefacts into `models/` and `results/` and run the figure scripts alone.
 
 ## Model versions
 
 Artefact filenames carry no version number. The version is written *inside*
 each pickle and verified on load by `orexin_paths.load_artifact()`, which raises
-on a mismatch. Versions are declared in exactly one place — `VERSIONS` in
-`orexin_paths.py`:
+on a mismatch. There is one version for the whole pipeline, declared in exactly
+one place — `PIPELINE_VERSION` in `orexin_paths.py`:
 
-| Component | Version | Artefact | Version field |
+| Artefact | Written by | Read by | Version field |
 |---|---|---|---|
-| SWR detection | 5.4.5 | `swr_detection.pkl` | `version` |
-| Synthetic SPW/ripple generator | 5.8.3 | `synthetic_libraries.pkl` | `generator_version` |
-| | | `generator_config.pkl` | `generator_version` |
-| Agent model | 2.5.11 | `agent_model_results.pkl` | `version` |
+| `data_processed/swr_detection.pkl` | stage 1 | stage 2, Figure 1 | `pipeline_version` |
+| `models/synthetic_libraries.pkl` | stage 2 | stage 3, Table 1 | `pipeline_version` |
+| `models/generator_config.pkl` | stage 2 | stage 3 | `pipeline_version` |
+| `models/validation_null.pkl` | stage 2 | Figure 2 | `pipeline_version` |
+| `results/agent_model_results.pkl` | stage 3 | Figures 3–5, S3, dissociation test | `pipeline_version` |
 
-Bumping a version means editing `VERSIONS` and regenerating the affected
-artefact. Any script that then loads a stale pickle fails immediately rather
+Bumping a version means editing `PIPELINE_VERSION` and regenerating the affected
+artefacts. Any script that then loads a stale pickle fails immediately rather
 than silently producing a figure from the wrong data.
 
 If you have an existing project directory with the old versioned filenames, run
-`python 00_migrate_filenames.py --dry-run` first, then without the flag.
+`python scripts/00_migrate.py --dry-run` first, then without the flag.
 
 ## Citation
 

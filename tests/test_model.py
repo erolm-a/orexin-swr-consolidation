@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from orexin_paths import (  # noqa: E402
-    DIRS, FILES, PROJECT_ROOT, VERSIONS,
+    DIRS, FILES, PROJECT_ROOT, PIPELINE_VERSION,
     ensure_dirs, load_artifact,
 )
 

@@ -14,20 +14,7 @@ from typing import List, Tuple
 import numpy as np
 from scipy import signal
 
-
-def ox_key(x: float) -> str:
-    """
-    Canonical OX2R level -> string key formatter.
-
-    Strips trailing zeros so the key is human-readable and unambiguous:
-        0.30  -> "0.3"
-        1.00  -> "1"
-        0.85  -> "0.85"
-        1.05  -> "1.05"
-    All generator/agent library keys must use this formatter:
-    ``f"{context}_ox{ox_key(level)}"``.
-    """
-    return f"{x:.4f}".rstrip("0").rstrip(".")
+from orexin_keys import ox_key  # canonical key formatter
 
 
 def bandpass(data, fs, lo, hi, order=4):

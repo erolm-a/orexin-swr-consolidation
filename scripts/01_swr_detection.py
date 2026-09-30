@@ -1,22 +1,52 @@
 """
-Stage 1 — SWR detection from CRCNS LFP recordings (detector v5.4.5).
+Stage 1 - SWR detection from LFP recordings.
 
-Reads:  data_raw/<session>/*.lfp|.eeg + XML metadata + sleep-state files
+Reads:  data_raw/<session>/*.lfp|.eeg, the accompanying XML metadata
+        and sleep-state annotations
 Writes: data_processed/swr_detection.pkl
 
-Also produces the visual-validation and distribution-validation panels
-used to check the detector before the synthetic library is built.
+Channel selection, spectral purity, SPW and ripple detection, coupling
+classification and the gold-standard subsets.
 
-Paths and artefact versions are resolved via orexin_paths.
+Channel selection is band-power only: SPW channels are the strongest
+5-40 Hz channels, ripple channels the strongest 150-250 Hz channels among
+those left, noise references the strongest 300-500 Hz channels among those
+left again. No probe layout is parsed, so no channel is excluded for being
+off-shank; the XML is read only for the LFP channel count and rate.
+
+Paths are resolved by orexin_paths; nothing here is machine-specific.
 """
 
-from common.paths import setup
+import sys
+from pathlib import Path
 
-DIRS, FILES, PROJECT_ROOT, VERSIONS, load_artifact = setup()
-from common.utils import bandpass
+
+def _repo_root() -> Path:
+    """Find the repository root whether this runs as a file or pasted in a cell."""
+    start = (
+        Path(globals()["__file__"]).resolve().parent
+        if "__file__" in globals()
+        else Path.cwd().resolve()
+    )
+    for d in (start, *start.parents):
+        if (d / "orexin_paths.py").exists():
+            return d
+    raise ImportError(
+        "orexin_paths.py not found above " + str(start) + ".\n"
+        "Running from a notebook? cd into the repository first, e.g.\n"
+        "    %cd /path/to/orexin-swr-consolidation"
+    )
+
+
+sys.path.insert(0, str(_repo_root()))
+
+from orexin_paths import DIRS, FILES, ensure_dirs, stamp  # noqa: E402
+from common.utils import bandpass  # noqa: E402
+
+ensure_dirs()
 
 # =============================================================================
-# CELL 6: SWR DETECTION v5.4.5
+# SWR DETECTION
 # =============================================================================
 
 
@@ -26,14 +56,21 @@ from pathlib import Path
 import pickle
 from datetime import datetime
 import warnings
-import mat73
 
 warnings.filterwarnings("ignore")
+
+try:
+    import mat73
+except ImportError:
+    import subprocess
+
+    subprocess.check_call(["pip", "install", "mat73", "-q"])
+    import mat73
 
 # Paths come from orexin_paths (see header). DIRS / FILES are already bound.
 
 print("=" * 70)
-print("SWR DETECTION v5.4.5 - FIXED CHANNEL SELECTION")
+print("SWR DETECTION")
 print("=" * 70)
 
 
@@ -127,9 +164,11 @@ def get_lfp_params(lfp_file, xml_files):
     for xml_file in xml_files:
         params = parse_xml_full(xml_file)
         if params is None:
+            print("  ⚠  Unable to parse the XML file")
             continue
         n_ch = params["n_channels"]
         if n_ch is None or n_int16 % n_ch != 0:
+            print("  ⚠  Ch size is not multiple of n_ch!")
             continue
         if params["lfp_sampling_rate"] is not None:
             n_samples = n_int16 // n_ch
@@ -269,21 +308,31 @@ def get_nrem_intervals_in_post(sessinfo):
     }
 
 
-# =============================================================================
-# FIX: SIMPLIFIED CHANNEL SELECTION - RAW POWER + EXCLUSION
-# =============================================================================
+# CHANNEL SELECTION — RAW BAND POWER WITH MUTUAL EXCLUSION
+#
+# SPW, ripple and noise channels are picked from band power alone: SPW by
+# 5-40 Hz power, ripple by 150-250 Hz power among the channels SPW did not
+# take, noise by 300-500 Hz power among the remainder. No probe layout is
+# consulted, so auxiliary channels are not excluded a priori; a channel that
+# is neither quiet nor flat is dropped by the veto, not by the wiring.
+
+import numpy as np
+from scipy import signal, stats
+
+CHANNEL_RULE = (
+    "raw band power; SPW = top SW power; "
+    "ripple = top ripple power excluding SPW; "
+    "noise = top noise/ripple ratio excluding both"
+)
 
 
 def select_channels_with_noise(lfp_file, n_ch, fs, intervals, verbose=True):
-    """
-    Select SPW, ripple, AND noise reference channels.
+    """Select SPW, ripple and noise-reference channels from band power."""
+    lfp_file = Path(lfp_file)
 
-    v5.4.5 FIX: Use RAW ripple power after excluding SPW channels.
-    No laminar ratio - it was selecting weak channels.
-    """
+    # ── channel metrics ─────────────────────────────────────────────────────
     mmap = np.memmap(lfp_file, dtype=np.int16, mode="r").reshape(-1, n_ch)
     n_samples = mmap.shape[0]
-
     print(f"    LFP: {n_samples / fs:.1f} sec, {n_ch} channels")
 
     if intervals and len(intervals["intervals"]) > 0:
@@ -300,7 +349,6 @@ def select_channels_with_noise(lfp_file, n_ch, fs, intervals, verbose=True):
     sample_end = max(sample_start + int(fs), min(sample_end, n_samples))
 
     channel_metrics = []
-
     for ch in range(n_ch):
         data = mmap[sample_start:sample_end, ch].astype(np.float32)
         std = np.std(data)
@@ -311,7 +359,6 @@ def select_channels_with_noise(lfp_file, n_ch, fs, intervals, verbose=True):
             or std > CONFIG["max_channel_std"]
             or abs(kurt) > CONFIG["max_kurtosis"]
         )
-
         if vetoed:
             channel_metrics.append(
                 {
@@ -325,25 +372,16 @@ def select_channels_with_noise(lfp_file, n_ch, fs, intervals, verbose=True):
             continue
 
         try:
-            spw_filt = bandpass(data, fs, CONFIG["spw_band"][0], CONFIG["spw_band"][1])
-            spw_power = np.var(spw_filt)
-        except:
+            spw_power = np.var(bandpass(data, fs, *CONFIG["spw_band"]))
+        except Exception:
             spw_power = 0
-
         try:
-            rip_filt = bandpass(
-                data, fs, CONFIG["ripple_band"][0], CONFIG["ripple_band"][1]
-            )
-            ripple_power = np.var(rip_filt)
-        except:
+            ripple_power = np.var(bandpass(data, fs, *CONFIG["ripple_band"]))
+        except Exception:
             ripple_power = 0
-
         try:
-            noise_filt = bandpass(
-                data, fs, CONFIG["noise_band"][0], CONFIG["noise_band"][1]
-            )
-            noise_power = np.var(noise_filt)
-        except:
+            noise_power = np.var(bandpass(data, fs, *CONFIG["noise_band"]))
+        except Exception:
             noise_power = 0
 
         channel_metrics.append(
@@ -355,101 +393,79 @@ def select_channels_with_noise(lfp_file, n_ch, fs, intervals, verbose=True):
                 "noise_power": noise_power,
             }
         )
-
     del mmap
 
     valid = [m for m in channel_metrics if not m["vetoed"]]
-    n_vetoed = n_ch - len(valid)
-    print(f"    Valid: {len(valid)}/{n_ch} (vetoed {n_vetoed})")
-
+    print(f"    Valid: {len(valid)}/{n_ch} (vetoed {n_ch - len(valid)})")
     if len(valid) < 4:
         return None
 
-    # Get power arrays
-    spw_powers = np.array([m["spw_power"] for m in valid])
-    rip_powers = np.array([m["ripple_power"] for m in valid])
-
-    # =========================================================================
-    # FIX: SIMPLE APPROACH - RAW POWER + EXCLUSION
-    # =========================================================================
-
-    # 1. Select SPW channels by raw SPW power
+    # ── 1. SPW channels: top-n by raw SW-band power ─────────────────────────
     n_spw = min(CONFIG["n_spw_channels"], len(valid))
-    spw_idx = np.argsort(spw_powers)[::-1][:n_spw]
-    spw_channels = [valid[i]["ch"] for i in spw_idx]
+    spw_sorted = sorted(valid, key=lambda m: m["spw_power"], reverse=True)
+    spw_channels = sorted(m["ch"] for m in spw_sorted[:n_spw])
     spw_set = set(spw_channels)
 
-    # 2. Select ripple channels by RAW RIPPLE POWER, excluding SPW channels
-    n_rip = min(CONFIG["n_ripple_channels"], len(valid))
-
-    # Get all non-SPW channels with their ripple power
-    rip_candidates = [
-        (i, valid[i]["ch"], valid[i]["ripple_power"])
-        for i in range(len(valid))
-        if valid[i]["ch"] not in spw_set
-    ]
-
-    # Sort by RAW ripple power (not ratio!)
-    rip_candidates.sort(key=lambda x: x[2], reverse=True)
-
-    # Take top n_rip
-    ripple_channels = [
-        rip_candidates[i][1] for i in range(min(n_rip, len(rip_candidates)))
-    ]
-
-    # 3. Compute coverage metric
-    selected_rip_power = sum(
-        rip_candidates[i][2] for i in range(min(n_rip, len(rip_candidates)))
+    # ── 2. ripple channels: top-n by raw ripple power, SPW already taken ────
+    rip_sorted = sorted(
+        (m for m in valid if m["ch"] not in spw_set),
+        key=lambda m: m["ripple_power"],
+        reverse=True,
     )
+    n_rip = min(CONFIG["n_ripple_channels"], len(rip_sorted))
+    ripple_channels = sorted(m["ch"] for m in rip_sorted[:n_rip])
+    rip_set = set(ripple_channels)
 
-    # Top-k by raw power (including SPW channels) for comparison
-    all_rip_sorted = sorted(
-        [(m["ch"], m["ripple_power"]) for m in valid], key=lambda x: x[1], reverse=True
-    )
-    topk_power = sum(p for _, p in all_rip_sorted[:n_rip])
-
-    coverage = selected_rip_power / (topk_power + 1e-10)
+    # Coverage: how much of the top-k ripple power the selection actually took
+    all_rip = sorted((m["ripple_power"] for m in valid), reverse=True)
+    selected_power = sum(m["ripple_power"] for m in rip_sorted[:n_rip])
+    topk_power = sum(all_rip[:n_rip])
+    coverage = selected_power / (topk_power + 1e-10)
 
     if verbose:
-        print(f"    --- Ripple Channel Selection ---")
+        print(f"    --- Channel Selection ({CHANNEL_RULE.split(';')[0]}) ---")
+        print(f"    SPW:    {spw_channels}")
         print(
-            f"    Top {n_rip} by raw power: {[ch for ch, _ in all_rip_sorted[:n_rip]]}"
+            f"            SW-band power "
+            f"{min(m['spw_power'] for m in spw_sorted[:n_spw]):.3g}–"
+            f"{max(m['spw_power'] for m in spw_sorted[:n_spw]):.3g}"
         )
-        print(f"    Selected (excl SPW):  {ripple_channels}")
-        print(f"    Coverage: {coverage * 100:.1f}%")
-
+        print(f"    Ripple: {ripple_channels}")
+        print(
+            f"            top {n_rip} by raw ripple power were "
+            f"{sorted(m['ch'] for m in rip_sorted[:n_rip])}; coverage "
+            f"{coverage * 100:.1f}%"
+        )
         if coverage < CONFIG["min_ripple_coverage"]:
             print(
-                f"    ⚠ WARNING: Coverage {coverage * 100:.1f}% < {CONFIG['min_ripple_coverage'] * 100:.0f}% threshold"
+                f"            ⚠ coverage {coverage * 100:.1f}% < "
+                f"{CONFIG['min_ripple_coverage'] * 100:.0f}% threshold"
             )
 
-    # 4. Select noise channels (exclude both SPW and ripple)
-    exclude_set = set(ripple_channels) | spw_set
-    noise_candidates = [
-        (i, m) for i, m in enumerate(valid) if m["ch"] not in exclude_set
-    ]
+    if len(spw_channels) < CONFIG["spw_min_channels"]:
+        print(f"    ⚠ Only {len(spw_channels)} SPW candidates; session skipped.")
+        return None
 
-    if noise_candidates:
-        eps = 1e-10
-        for i, m in noise_candidates:
-            m["noise_score"] = m["noise_power"] / (m["ripple_power"] + eps)
-        noise_candidates.sort(key=lambda x: x[1]["noise_score"], reverse=True)
-        n_noise = min(CONFIG["n_noise_channels"], len(noise_candidates))
-        noise_channels = [noise_candidates[i][1]["ch"] for i in range(n_noise)]
-    else:
-        noise_channels = []
-
-    overlap = set(spw_channels) & set(ripple_channels)
+    # ── 3. noise-reference channels ─────────────────────────────────────────
+    exclude_set = spw_set | rip_set
+    noise_candidates = [m for m in valid if m["ch"] not in exclude_set]
+    eps = 1e-10
+    for m in noise_candidates:
+        m["noise_score"] = m["noise_power"] / (m["ripple_power"] + eps)
+    noise_candidates.sort(key=lambda m: m["noise_score"], reverse=True)
+    n_noise = min(CONFIG["n_noise_channels"], len(noise_candidates))
+    noise_channels = [m["ch"] for m in noise_candidates[:n_noise]]
 
     return {
-        "spw_channels": sorted(spw_channels),
-        "ripple_channels": sorted(ripple_channels),
+        "spw_channels": spw_channels,
+        "ripple_channels": ripple_channels,
         "noise_channels": sorted(noise_channels),
-        "n_overlap": len(overlap),
+        "n_overlap": len(spw_set & rip_set),
         "n_valid": len(valid),
         "fs": fs,
         "n_channels_total": n_ch,
         "ripple_coverage": coverage,
+        "rule": CHANNEL_RULE,
         "all_channel_metrics": valid,
     }
 
@@ -481,10 +497,14 @@ def compute_spectral_purity_welch(
     gamma_mask = (freqs >= gamma_band[0]) & (freqs <= gamma_band[1])
 
     ripple_power = (
-        np.trapz(psd[ripple_mask], freqs[ripple_mask]) if np.any(ripple_mask) else 0.0
+        np.trapezoid(psd[ripple_mask], freqs[ripple_mask])
+        if np.any(ripple_mask)
+        else 0.0
     )
     gamma_power = (
-        np.trapz(psd[gamma_mask], freqs[gamma_mask]) if np.any(gamma_mask) else np.nan
+        np.trapezoid(psd[gamma_mask], freqs[gamma_mask])
+        if np.any(gamma_mask)
+        else np.nan
     )
 
     if gamma_floor is not None and np.isfinite(gamma_power):
@@ -671,7 +691,7 @@ def detect_ripples_with_noise_veto(
                     freqs <= CONFIG["gamma_band"][1]
                 )
                 if np.any(gamma_mask):
-                    gamma_pwr = np.trapz(psd[gamma_mask], freqs[gamma_mask])
+                    gamma_pwr = np.trapezoid(psd[gamma_mask], freqs[gamma_mask])
                     if np.isfinite(gamma_pwr) and gamma_pwr > 0:
                         gamma_powers_all.append(gamma_pwr)
 
@@ -1138,7 +1158,7 @@ def process_session(session_name, data_dir):
 
     return {
         "name": session_name,
-        "version": VERSIONS["detector"],
+        **stamp(),
         "lfp_params": lfp_params,
         "nrem_intervals": intervals,
         "channel_info": ch_info,
@@ -1183,7 +1203,7 @@ if results:
     )
 
     print("\n" + "=" * 90)
-    print("v5.4.5 SUMMARY - FIXED CHANNEL SELECTION")
+    print("SUMMARY")
     print("=" * 90)
     print(
         f"\n{'Session':<18} {'NREM':<7} {'SPW/m':<7} {'SWR/m':<7} {'All/m':<7} {'Coup_SWR':<9} {'Purity':<7} {'Cover%':<7}"
@@ -1209,7 +1229,7 @@ if results:
     with open(output_path, "wb") as f:
         pickle.dump(
             {
-                "version": VERSIONS["detector"],
+                **stamp(),
                 "config": CONFIG,
                 "datasets": results,
                 "timestamp": datetime.now().isoformat(),
@@ -1245,7 +1265,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
 from pathlib import Path
-import pickle
 
 # --------- CONFIG YOU CAN TWEAK ----------
 SESSION_NAME = (
@@ -1267,27 +1286,19 @@ def _band_sos(fs, band, order=4):
     return signal.butter(order, [lo, hi], btype="band", fs=fs, output="sos")
 
 
-def _find_latest_pkl(data_processed_dir: Path):
-    pkls = sorted(
-        data_processed_dir.glob("swr_detection_v*.pkl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return pkls[0] if pkls else None
-
-
 def load_results_fallback(DIRS):
-    # Use in-memory `results` if present, else load latest pkl
+    # Use in-memory `results` if present, else load the detector artefact
     if (
         "results" in globals()
         and isinstance(globals()["results"], list)
         and len(globals()["results"]) > 0
     ):
         return globals()["results"]
-    pkl = _find_latest_pkl(DIRS["data_processed"])
-    if pkl is None:
-        raise RuntimeError("No in-memory `results` and no swr_detection_v*.pkl found.")
-    with open(pkl, "rb") as f:
+    if not FILES["detector"].exists():
+        raise RuntimeError(
+            f"No in-memory `results` and no {FILES['detector'].name} found."
+        )
+    with open(FILES["detector"], "rb") as f:
         obj = pickle.load(f)
     return obj.get("datasets", [])
 
@@ -1431,691 +1442,3 @@ print(
 
 rp, npow = compute_channel_powers(lfp_path, n_ch, fs, start_samp, end_samp)
 plot_selection(rp, npow, selected_ripple, top_n=TOP_N)
-
-# =============================================================================
-# CELL 6p: SWR VISUAL VALIDATION - PLOT RANDOM EVENTS
-# =============================================================================
-"""
-Visual validation of detected SWR events.
-For each event, show:
-1. Raw LFP (wideband) - SPW channel
-2. SPW band envelope (5-40 Hz) - radiatum
-3. Ripple-band filtered (150-250 Hz) - pyramidal
-4. Spectrogram around peak
-"""
-
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy import signal
-from pathlib import Path
-import pickle
-
-# ============ CONFIG ============
-SESSION_NAME = (
-    "Cicero_09102014"  # None = use best session, or specify e.g. "Cicero_09172014"
-)
-N_EVENTS = 30  # Number of random SWR events to plot
-WINDOW_MS = 200  # Window around peak (±100ms)
-COLS = 5  # Columns in grid
-SPECTROGRAM = True  # Include spectrogram panel
-SEED = 42  # For reproducibility
-# ================================
-
-# Paths come from orexin_paths (see header). DIRS / FILES are already bound.
-
-# Load results
-pkl_path = FILES["detector"]
-with open(pkl_path, "rb") as f:
-    data = pickle.load(f)
-results = data["datasets"]
-config = data["config"]
-
-# Pick session
-if SESSION_NAME:
-    sess = next((r for r in results if r["name"] == SESSION_NAME), results[0])
-else:
-    sess = max(results, key=lambda r: r["ripple_tiers"]["n_swr"])
-
-print(f"Session: {sess['name']}")
-print(f"SWR events: {sess['ripple_tiers']['n_swr']}")
-print(f"SPW channels: {sess['channel_info']['spw_channels']}")
-print(f"Ripple channels: {sess['channel_info']['ripple_channels']}")
-
-# Get paths and params
-session_dir = DIRS["data_raw"] / sess["name"]
-lfp_files = list(session_dir.glob("*.eeg")) + list(session_dir.glob("*.lfp"))
-lfp_path = lfp_files[0]
-
-n_ch = sess["lfp_params"]["n_channels"]
-fs = sess["lfp_params"]["fs"]
-
-# Get SWR events
-swr_events = sess["ripple_tiers"]["ripples_swr"]
-spw_channels = sess["channel_info"]["spw_channels"]
-ripple_channels = sess["channel_info"]["ripple_channels"]
-
-# Sample random events
-np.random.seed(SEED)
-n_to_plot = min(N_EVENTS, len(swr_events))
-indices = np.random.choice(len(swr_events), n_to_plot, replace=False)
-indices = sorted(indices)
-
-# Load LFP
-mmap = np.memmap(lfp_path, dtype=np.int16, mode="r").reshape(-1, n_ch)
-
-# Filter design (canonical bandpass lives in common.utils)
-
-# Window samples
-half_win = int((WINDOW_MS / 2) * fs / 1000)
-
-# Figure setup
-rows_per_event = 4 if SPECTROGRAM else 3
-n_rows = int(np.ceil(n_to_plot / COLS))
-
-fig, axes = plt.subplots(
-    n_rows * rows_per_event, COLS, figsize=(COLS * 3, n_rows * rows_per_event * 1.2)
-)
-if n_rows == 1:
-    axes = axes.reshape(rows_per_event, -1)
-
-session_name = sess["name"]
-fig.suptitle(f"{session_name} - {n_to_plot} Random SWR Events", fontsize=14, y=1.02)
-
-for plot_idx, evt_idx in enumerate(indices):
-    evt = swr_events[evt_idx]
-    peak_samp = int(evt["peak_sec"] * fs)
-
-    # Extract window
-    start = max(0, peak_samp - half_win)
-    end = min(mmap.shape[0], peak_samp + half_win)
-
-    # Get data from representative channels
-    spw_ch = spw_channels[0]  # First SPW channel (radiatum)
-    rip_ch = ripple_channels[0]  # First ripple channel (pyramidal)
-
-    raw_spw = mmap[start:end, spw_ch].astype(np.float32)
-    raw_rip = mmap[start:end, rip_ch].astype(np.float32)
-
-    # Filter
-    spw_filt = bandpass(raw_spw, fs, 5, 40)
-    spw_env = np.abs(signal.hilbert(spw_filt))
-    rip_filt = bandpass(raw_rip, fs, 150, 250)
-
-    # Time axis
-    t_ms = np.arange(len(raw_spw)) / fs * 1000 - (WINDOW_MS / 2)
-
-    # Grid position
-    col = plot_idx % COLS
-    row_base = (plot_idx // COLS) * rows_per_event
-
-    # Panel 1: Raw LFP (SPW channel)
-    ax1 = axes[row_base, col] if n_rows > 1 or rows_per_event > 1 else axes[col]
-    ax1.plot(t_ms, raw_spw, "k", lw=0.5)
-    ax1.axvline(0, color="r", lw=0.5, alpha=0.5)
-    ax1.set_ylabel("Raw", fontsize=7)
-    purity_val = evt.get("spectral_purity", 0)
-    ax1.set_title(
-        f"#{evt_idx} | {evt['duration_ms']:.0f}ms | pur={purity_val:.1f}", fontsize=7
-    )
-    ax1.tick_params(labelsize=6)
-    ax1.set_xticklabels([])
-
-    # Panel 2: SPW envelope
-    ax2 = axes[row_base + 1, col]
-    ax2.plot(t_ms, spw_filt, "b", lw=0.5, alpha=0.5)
-    ax2.plot(t_ms, spw_env, "b", lw=1)
-    ax2.axvline(0, color="r", lw=0.5, alpha=0.5)
-    ax2.set_ylabel("SPW", fontsize=7)
-    ax2.tick_params(labelsize=6)
-    ax2.set_xticklabels([])
-
-    # Panel 3: Ripple filtered
-    ax3 = axes[row_base + 2, col]
-    ax3.plot(t_ms, rip_filt, "purple", lw=0.5)
-    ax3.axvline(0, color="r", lw=0.5, alpha=0.5)
-    ax3.set_ylabel("Ripple", fontsize=7)
-    ax3.tick_params(labelsize=6)
-
-    if SPECTROGRAM:
-        ax3.set_xticklabels([])
-        # Panel 4: Spectrogram
-        ax4 = axes[row_base + 3, col]
-
-        # Compute spectrogram
-        nperseg = min(64, len(raw_rip) // 4)
-        if nperseg >= 16:
-            f, t_spec, Sxx = signal.spectrogram(
-                raw_rip, fs=fs, nperseg=nperseg, noverlap=nperseg // 2, nfft=128
-            )
-            # Focus on ripple band
-            freq_mask = (f >= 50) & (f <= 300)
-            t_spec_ms = (t_spec - t_spec[len(t_spec) // 2]) * 1000
-
-            ax4.pcolormesh(
-                t_spec_ms,
-                f[freq_mask],
-                10 * np.log10(Sxx[freq_mask] + 1e-10),
-                shading="gouraud",
-                cmap="hot",
-            )
-            ax4.axhline(150, color="cyan", lw=0.5, ls="--", alpha=0.7)
-            ax4.axhline(250, color="cyan", lw=0.5, ls="--", alpha=0.7)
-            ax4.axvline(0, color="white", lw=0.5, alpha=0.5)
-        ax4.set_ylabel("Hz", fontsize=7)
-        ax4.set_xlabel("ms", fontsize=7)
-        ax4.tick_params(labelsize=6)
-    else:
-        ax3.set_xlabel("ms", fontsize=7)
-
-# Hide empty subplots
-for idx in range(n_to_plot, COLS * n_rows):
-    col = idx % COLS
-    row_base = (idx // COLS) * rows_per_event
-    for r in range(rows_per_event):
-        if row_base + r < axes.shape[0]:
-            axes[row_base + r, col].axis("off")
-
-plt.tight_layout()
-save_path = DIRS["data_processed"] / f"swr_validation_{session_name}.png"
-plt.savefig(save_path, dpi=150, bbox_inches="tight")
-plt.show()
-
-del mmap
-
-print(f"\nSaved to {save_path}")
-
-
-# =============================================================================
-# BONUS: Summary statistics of plotted events
-# =============================================================================
-print("\n" + "=" * 60)
-print("PLOTTED EVENTS SUMMARY")
-print("=" * 60)
-
-plotted_events = [swr_events[i] for i in indices]
-durations = [e["duration_ms"] for e in plotted_events]
-purities = [
-    e["spectral_purity"]
-    for e in plotted_events
-    if np.isfinite(e.get("spectral_purity", np.nan))
-]
-peak_freqs = [
-    e["peak_freq"] for e in plotted_events if np.isfinite(e.get("peak_freq", np.nan))
-]
-n_cycles_list = [e["n_cycles"] for e in plotted_events]
-
-print(
-    f"Duration: {np.mean(durations):.1f} +/- {np.std(durations):.1f} ms (range: {np.min(durations):.0f}-{np.max(durations):.0f})"
-)
-print(
-    f"Purity:   {np.mean(purities):.2f} +/- {np.std(purities):.2f} (range: {np.min(purities):.1f}-{np.max(purities):.1f})"
-)
-print(
-    f"Peak Hz:  {np.mean(peak_freqs):.1f} +/- {np.std(peak_freqs):.1f} (range: {np.min(peak_freqs):.0f}-{np.max(peak_freqs):.0f})"
-)
-print(
-    f"Cycles:   {np.mean(n_cycles_list):.1f} +/- {np.std(n_cycles_list):.1f} (range: {np.min(n_cycles_list):.0f}-{np.max(n_cycles_list):.0f})"
-)
-
-# =============================================================================
-# CELL 6r: SWR DISTRIBUTION VALIDATION + COUPLING KPIs
-# =============================================================================
-"""
-Histogram validation of SWR-tier events across all sessions.
-Shows: peak_freq, duration_ms, spectral_purity, coupling_lags_ms
-Plus coupling timing KPIs and frequency resolution diagnostic.
-"""
-
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-import pickle
-
-# Paths come from orexin_paths (see header). DIRS / FILES are already bound.
-
-# Load results
-pkl_path = FILES["detector"]
-with open(pkl_path, "rb") as f:
-    data = pickle.load(f)
-results = data["datasets"]
-
-# Colors for sessions
-colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
-
-# Collect data per session (compute fresh to avoid bugs)
-session_data = {}
-for i, sess in enumerate(results):
-    name = sess["name"]
-    swr_events = sess["ripple_tiers"]["ripples_swr"]
-    coupling_info = sess["coupling_swr"]
-
-    # Extract arrays fresh
-    peak_freqs = [
-        e["peak_freq"] for e in swr_events if np.isfinite(e.get("peak_freq", np.nan))
-    ]
-    durations = [e["duration_ms"] for e in swr_events]
-    purities = [
-        e["spectral_purity"]
-        for e in swr_events
-        if np.isfinite(e.get("spectral_purity", np.nan))
-    ]
-    lags = (
-        coupling_info["coupling_lags_ms"].tolist()
-        if len(coupling_info["coupling_lags_ms"]) > 0
-        else []
-    )
-
-    session_data[name] = {
-        "color": colors[i % len(colors)],
-        "peak_freq": peak_freqs,
-        "duration_ms": durations,
-        "purity": purities,
-        "coupling_lags": lags,
-        "n_swr": len(swr_events),
-        "n_unique_freq": len(set(peak_freqs)),
-    }
-
-# Compute pooled arrays
-all_freq = [f for d in session_data.values() for f in d["peak_freq"]]
-all_dur = [dur for d in session_data.values() for dur in d["duration_ms"]]
-all_purity = [p for d in session_data.values() for p in d["purity"]]
-all_lags = [l for d in session_data.values() for l in d["coupling_lags"]]
-
-# Create figure with extra row for KPIs
-fig = plt.figure(figsize=(14, 14))
-gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 0.6], hspace=0.3)
-
-fig.suptitle(
-    "SWR-Tier Distribution Validation (All Sessions)", fontsize=14, fontweight="bold"
-)
-
-# Define bins
-bins_freq = np.linspace(140, 220, 25)
-bins_dur = np.linspace(15, 100, 25)
-bins_purity = np.linspace(0, 15, 30)
-bins_lag = np.linspace(-30, 60, 30)
-
-# 1. Peak Frequency
-ax1 = fig.add_subplot(gs[0, 0])
-for name, d in session_data.items():
-    if d["peak_freq"]:
-        ax1.hist(
-            d["peak_freq"],
-            bins=bins_freq,
-            alpha=0.5,
-            label=f"{name} (n={len(d['peak_freq'])})",
-            color=d["color"],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-ax1.axvline(150, color="red", linestyle="--", lw=1.5, label="Ripple band")
-ax1.axvline(200, color="red", linestyle="--", lw=1.5)
-ax1.axvline(
-    175, color="green", linestyle="-", lw=2, alpha=0.7, label="Expected peak (~175 Hz)"
-)
-ax1.set_xlabel("Peak Frequency (Hz)", fontsize=11)
-ax1.set_ylabel("Count", fontsize=11)
-ax1.set_title("Peak Frequency Distribution", fontsize=12)
-ax1.legend(fontsize=8)
-ax1.set_xlim(140, 220)
-
-# Per-session stats in text box
-freq_stats = "Per-session (mean ± std):\n"
-for name, d in session_data.items():
-    if d["peak_freq"]:
-        freq_stats += f"  {name[:8]}: {np.mean(d['peak_freq']):.1f}±{np.std(d['peak_freq']):.1f}\n"
-freq_stats += f"Pooled: {np.mean(all_freq):.1f}±{np.std(all_freq):.1f} Hz"
-ax1.text(
-    0.97,
-    0.97,
-    freq_stats,
-    transform=ax1.transAxes,
-    fontsize=8,
-    va="top",
-    ha="right",
-    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    family="monospace",
-)
-
-# 2. Duration
-ax2 = fig.add_subplot(gs[0, 1])
-for name, d in session_data.items():
-    if d["duration_ms"]:
-        ax2.hist(
-            d["duration_ms"],
-            bins=bins_dur,
-            alpha=0.5,
-            label=f"{name} (n={len(d['duration_ms'])})",
-            color=d["color"],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-ax2.axvline(30, color="orange", linestyle="--", lw=1.5, label="Typical range")
-ax2.axvline(80, color="orange", linestyle="--", lw=1.5)
-ax2.set_xlabel("Duration (ms)", fontsize=11)
-ax2.set_ylabel("Count", fontsize=11)
-ax2.set_title("Duration Distribution", fontsize=12)
-ax2.legend(fontsize=8)
-ax2.set_xlim(15, 100)
-
-dur_stats = "Per-session (mean ± std):\n"
-for name, d in session_data.items():
-    if d["duration_ms"]:
-        dur_stats += f"  {name[:8]}: {np.mean(d['duration_ms']):.1f}±{np.std(d['duration_ms']):.1f}\n"
-dur_stats += f"Pooled: {np.mean(all_dur):.1f}±{np.std(all_dur):.1f} ms"
-ax2.text(
-    0.97,
-    0.97,
-    dur_stats,
-    transform=ax2.transAxes,
-    fontsize=8,
-    va="top",
-    ha="right",
-    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    family="monospace",
-)
-
-# 3. Spectral Purity
-ax3 = fig.add_subplot(gs[1, 0])
-for name, d in session_data.items():
-    if d["purity"]:
-        ax3.hist(
-            d["purity"],
-            bins=bins_purity,
-            alpha=0.5,
-            label=f"{name} (n={len(d['purity'])})",
-            color=d["color"],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-ax3.axvline(2.0, color="red", linestyle="--", lw=1.5, label="SWR threshold (≥2.0)")
-ax3.set_xlabel("Spectral Purity (ripple/gamma power)", fontsize=11)
-ax3.set_ylabel("Count", fontsize=11)
-ax3.set_title("Spectral Purity Distribution", fontsize=12)
-ax3.legend(fontsize=8)
-ax3.set_xlim(0, 15)
-
-pur_stats = "Per-session (mean ± std):\n"
-for name, d in session_data.items():
-    if d["purity"]:
-        pur_stats += (
-            f"  {name[:8]}: {np.mean(d['purity']):.1f}±{np.std(d['purity']):.1f}\n"
-        )
-pur_stats += f"Pooled: {np.mean(all_purity):.1f}±{np.std(all_purity):.1f}"
-ax3.text(
-    0.97,
-    0.97,
-    pur_stats,
-    transform=ax3.transAxes,
-    fontsize=8,
-    va="top",
-    ha="right",
-    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    family="monospace",
-)
-
-# 4. Coupling Lags
-ax4 = fig.add_subplot(gs[1, 1])
-for name, d in session_data.items():
-    if d["coupling_lags"]:
-        ax4.hist(
-            d["coupling_lags"],
-            bins=bins_lag,
-            alpha=0.5,
-            label=f"{name} (n={len(d['coupling_lags'])})",
-            color=d["color"],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-ax4.axvline(0, color="black", linestyle="-", lw=2, label="SPW peak (t=0)")
-ax4.axvline(-20, color="gray", linestyle=":", lw=1, alpha=0.7)
-ax4.axvline(50, color="gray", linestyle=":", lw=1, alpha=0.7, label="Coupling window")
-ax4.set_xlabel("Coupling Lag (ms, ripple peak - SPW peak)", fontsize=11)
-ax4.set_ylabel("Count", fontsize=11)
-ax4.set_title("SPW→SWR Coupling Lag Distribution", fontsize=12)
-ax4.legend(fontsize=8)
-ax4.set_xlim(-30, 60)
-
-lag_stats = "Per-session (mean ± std):\n"
-for name, d in session_data.items():
-    if d["coupling_lags"]:
-        lag_stats += f"  {name[:8]}: {np.mean(d['coupling_lags']):.1f}±{np.std(d['coupling_lags']):.1f}\n"
-if all_lags:
-    lag_stats += f"Pooled: {np.mean(all_lags):.1f}±{np.std(all_lags):.1f} ms"
-ax4.text(
-    0.97,
-    0.97,
-    lag_stats,
-    transform=ax4.transAxes,
-    fontsize=8,
-    va="top",
-    ha="right",
-    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-    family="monospace",
-)
-
-# 5. KPI Table (bottom row spanning both columns)
-ax5 = fig.add_subplot(gs[2, :])
-ax5.axis("off")
-
-# Compute KPIs per session
-kpi_data = []
-for name, d in session_data.items():
-    lags = np.array(d["coupling_lags"])
-    if len(lags) > 0:
-        pct_lead = np.mean(lags < 0) * 100
-        median_lag = np.median(lags)
-        q25, q75 = np.percentile(lags, [25, 75])
-        iqr = q75 - q25
-        kpi_data.append(
-            {
-                "session": name,
-                "n": len(lags),
-                "pct_lead": pct_lead,
-                "median": median_lag,
-                "q25": q25,
-                "q75": q75,
-                "iqr": iqr,
-            }
-        )
-
-# Pooled KPIs
-all_lags_arr = np.array(all_lags)
-pooled_pct_lead = np.mean(all_lags_arr < 0) * 100
-pooled_median = np.median(all_lags_arr)
-pooled_q25, pooled_q75 = np.percentile(all_lags_arr, [25, 75])
-pooled_iqr = pooled_q75 - pooled_q25
-
-# Create table text
-table_text = "COUPLING TIMING KPIs\n"
-table_text += "=" * 95 + "\n"
-table_text += f"{'Session':<22} {'N':<8} {'% Ripple Leads':<16} {'Median Lag':<14} {'IQR':<14} {'[Q25, Q75]':<18}\n"
-table_text += "-" * 95 + "\n"
-
-for kpi in kpi_data:
-    table_text += f"{kpi['session']:<22} {kpi['n']:<8} {kpi['pct_lead']:<16.1f} {kpi['median']:<14.1f} {kpi['iqr']:<14.1f} [{kpi['q25']:.1f}, {kpi['q75']:.1f}]\n"
-
-table_text += "-" * 95 + "\n"
-table_text += f"{'POOLED':<22} {len(all_lags_arr):<8} {pooled_pct_lead:<16.1f} {pooled_median:<14.1f} {pooled_iqr:<14.1f} [{pooled_q25:.1f}, {pooled_q75:.1f}]\n"
-table_text += "=" * 95 + "\n\n"
-
-# Interpretation
-table_text += "INTERPRETATION:\n"
-if 40 < pooled_pct_lead < 60:
-    table_text += f"  • Ripple leads {pooled_pct_lead:.0f}% → SPW and ripple are near-synchronous (expected)\n"
-elif pooled_pct_lead <= 40:
-    table_text += (
-        f"  • Ripple leads {pooled_pct_lead:.0f}% → Ripple typically follows SPW peak\n"
-    )
-else:
-    table_text += f"  • Ripple leads {pooled_pct_lead:.0f}% → Ripple often precedes SPW peak (normal for CA1)\n"
-
-if abs(pooled_median) < 5:
-    table_text += (
-        f"  • Median lag = {pooled_median:.1f} ms → Near-perfect alignment ✓\n"
-    )
-elif pooled_median < -5:
-    table_text += (
-        f"  • Median lag = {pooled_median:.1f} ms → Ripple precedes SPW deflection\n"
-    )
-else:
-    table_text += (
-        f"  • Median lag = {pooled_median:.1f} ms → Ripple follows SPW deflection\n"
-    )
-
-if pooled_iqr < 20:
-    table_text += f"  • IQR = {pooled_iqr:.1f} ms → Tight coupling (low jitter) ✓\n"
-elif pooled_iqr < 30:
-    table_text += f"  • IQR = {pooled_iqr:.1f} ms → Moderate coupling jitter\n"
-else:
-    table_text += f"  • IQR = {pooled_iqr:.1f} ms → High jitter - review detection\n"
-
-# Add frequency resolution note
-table_text += "\n" + "-" * 95 + "\n"
-table_text += "NOTE: Peak frequency has limited resolution (fs/nperseg = 1250/128 ≈ 9.8 Hz bins)\n"
-for name, d in session_data.items():
-    table_text += f"  {name}: {d['n_unique_freq']} unique freq values\n"
-
-ax5.text(
-    0.5,
-    0.98,
-    table_text,
-    transform=ax5.transAxes,
-    fontsize=9,
-    family="monospace",
-    va="top",
-    ha="center",
-    bbox=dict(boxstyle="round", facecolor="lightgray", alpha=0.3),
-)
-
-plt.tight_layout()
-save_path = DIRS["data_processed"] / "swr_distributions_with_kpis.png"
-plt.savefig(save_path, dpi=150, bbox_inches="tight")
-plt.show()
-
-print(f"\nSaved to {save_path}")
-
-# =============================================================================
-# Console Output: Full Stats Table
-# =============================================================================
-print("\n" + "=" * 100)
-print("FULL SWR-TIER DISTRIBUTION SUMMARY (Per-Session)")
-print("=" * 100)
-print(
-    f"\n{'Session':<22} {'N_SWR':<8} {'Freq Mean±Std':<18} {'Dur Mean±Std':<18} {'Purity Mean±Std':<18} {'Unique Freq':<12}"
-)
-print("-" * 100)
-
-for name, d in session_data.items():
-    freq_mean = np.mean(d["peak_freq"]) if d["peak_freq"] else np.nan
-    freq_std = np.std(d["peak_freq"]) if d["peak_freq"] else np.nan
-    dur_mean = np.mean(d["duration_ms"]) if d["duration_ms"] else np.nan
-    dur_std = np.std(d["duration_ms"]) if d["duration_ms"] else np.nan
-    pur_mean = np.mean(d["purity"]) if d["purity"] else np.nan
-    pur_std = np.std(d["purity"]) if d["purity"] else np.nan
-
-    print(
-        f"{name:<22} {d['n_swr']:<8} {freq_mean:.1f} ± {freq_std:.1f} Hz    {dur_mean:.1f} ± {dur_std:.1f} ms    {pur_mean:.2f} ± {pur_std:.2f}       {d['n_unique_freq']}"
-    )
-
-print("-" * 100)
-print(
-    f"{'POOLED':<22} {sum(d['n_swr'] for d in session_data.values()):<8} "
-    f"{np.mean(all_freq):.1f} ± {np.std(all_freq):.1f} Hz    "
-    f"{np.mean(all_dur):.1f} ± {np.std(all_dur):.1f} ms    "
-    f"{np.mean(all_purity):.2f} ± {np.std(all_purity):.2f}       "
-    f"{len(set(all_freq))}"
-)
-print("=" * 100)
-
-# =============================================================================
-# Coupling KPIs Console
-# =============================================================================
-print("\n" + "=" * 100)
-print("COUPLING TIMING KPIs")
-print("=" * 100)
-print(
-    f"{'Session':<22} {'N':<8} {'% Ripple Leads':<16} {'Median Lag':<14} {'IQR':<14} {'[Q25, Q75]':<18}"
-)
-print("-" * 100)
-
-for kpi in kpi_data:
-    print(
-        f"{kpi['session']:<22} {kpi['n']:<8} {kpi['pct_lead']:<16.1f} {kpi['median']:<14.1f} {kpi['iqr']:<14.1f} [{kpi['q25']:.1f}, {kpi['q75']:.1f}]"
-    )
-
-print("-" * 100)
-print(
-    f"{'POOLED':<22} {len(all_lags_arr):<8} {pooled_pct_lead:<16.1f} {pooled_median:<14.1f} {pooled_iqr:<14.1f} [{pooled_q25:.1f}, {pooled_q75:.1f}]"
-)
-print("=" * 100)
-
-# =============================================================================
-# Final Verdict
-# =============================================================================
-print("\n" + "=" * 100)
-print("PHYSIOLOGICAL VERDICT")
-print("=" * 100)
-
-verdicts = []
-verdict_pass = True
-
-# Check 1: Peak frequency (use mean since median is quantized)
-freq_mean_p = np.mean(all_freq)
-if 160 <= freq_mean_p <= 190:
-    verdicts.append(
-        f"✅ Peak frequency: {freq_mean_p:.1f} Hz mean (expected 160-190 Hz)"
-    )
-else:
-    verdicts.append(
-        f"⚠️  Peak frequency: {freq_mean_p:.1f} Hz mean (outside 160-190 Hz)"
-    )
-    verdict_pass = False
-
-# Check 2: Duration
-dur_mean_p = np.mean(all_dur)
-if 25 <= dur_mean_p <= 60:
-    verdicts.append(f"✅ Duration: {dur_mean_p:.1f} ms mean (expected 25-60 ms)")
-else:
-    verdicts.append(f"⚠️  Duration: {dur_mean_p:.1f} ms mean (outside 25-60 ms)")
-    verdict_pass = False
-
-# Check 3: Purity
-pur_mean_p = np.mean(all_purity)
-if pur_mean_p >= 2.5:
-    verdicts.append(
-        f"✅ Spectral purity: {pur_mean_p:.2f} mean (good frequency specificity)"
-    )
-else:
-    verdicts.append(f"⚠️  Spectral purity: {pur_mean_p:.2f} mean (below 2.5)")
-    verdict_pass = False
-
-# Check 4: Coupling lag
-if abs(pooled_median) <= 10:
-    verdicts.append(f"✅ Coupling lag: {pooled_median:.1f} ms median (well-aligned)")
-else:
-    verdicts.append(f"⚠️  Coupling lag: {pooled_median:.1f} ms median (offset > 10ms)")
-    verdict_pass = False
-
-# Check 5: Coupling IQR
-if pooled_iqr <= 25:
-    verdicts.append(f"✅ Coupling IQR: {pooled_iqr:.1f} ms (tight jitter)")
-else:
-    verdicts.append(f"⚠️  Coupling IQR: {pooled_iqr:.1f} ms (high jitter)")
-    verdict_pass = False
-
-# Check 6: Frequency resolution note
-verdicts.append(
-    f"ℹ️  Freq resolution: ~9.8 Hz (only {len(set(all_freq))} unique values) - cosmetic issue only"
-)
-
-for v in verdicts:
-    print(v)
-
-print("\n" + "-" * 100)
-if verdict_pass:
-    print("🎯 ALL CHECKS PASSED: Detected SWRs are a coherent physiological class!")
-    print("   Pipeline v5.4.5 is VALIDATED. Ready for synthetic generation.")
-else:
-    print("⚠️  Some checks flagged - review distributions before proceeding.")
-print("=" * 100)

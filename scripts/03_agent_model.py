@@ -1,141 +1,108 @@
 """
-Stage 3 — rate-based consolidation agent (model v2.5.11).
+Stage 3 - rate-based encoding and consolidation agent.
 
 Reads:  models/synthetic_libraries.pkl
         models/generator_config.pkl
 Writes: results/agent_model_results.pkl
 
-Contains RateConsolidationAgent / RateReadout, the OX2R sweep, the
-encoding/consolidation dissociation, the complexity sweep, and
-limb_decomposition().
+The OX2R sweep, the encoding/consolidation dissociation, the frozen-gate
+control, the divergence, load, budget and complexity sweeps, and the
+robustness battery.
 
-Paths and artefact versions are resolved via orexin_paths.
+Paths are resolved by orexin_paths; nothing here is machine-specific.
 """
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+def _repo_root() -> Path:
+    """Find the repository root whether this runs as a file or pasted in a cell."""
+    start = (Path(globals()["__file__"]).resolve().parent
+             if "__file__" in globals() else Path.cwd().resolve())
+    for d in (start, *start.parents):
+        if (d / "orexin_paths.py").exists():
+            return d
+    raise ImportError(
+        "orexin_paths.py not found above " + str(start) + ".\n"
+        "Running from a notebook? cd into the repository first, e.g.\n"
+        "    %cd /path/to/orexin-swr-consolidation")
 
-from orexin_paths import (  # noqa: E402
-    DIRS, FILES, PROJECT_ROOT, VERSIONS,
-    ensure_dirs, load_artifact,
-)
+
+sys.path.insert(0, str(_repo_root()))
+
+from orexin_paths import DIRS, FILES, ensure_dirs, load_artifact, stamp  # noqa: E402
+from orexin_keys import ox_key  # noqa: E402
 
 ensure_dirs()
 
 # =============================================================================
-# CELL 9: OREXIN-SWR-MEMORY AGENT MODEL (v2.5.11)
+# OREXIN-SWR-MEMORY AGENT MODEL
 # =============================================================================
 """
-AGENT MODEL - v2.5.11
+Rate-based encoding and consolidation agent.
 
-BASE: v2.5.9 (dual-pathway branching mechanism + all FIX A–K confirmed)
+Replay plans
+------------
+build_replay_plan_ox() draws its event count from the OX2R-specific trial, so
+the number of consolidation events tracks the SPW incidence the library
+carries for that level. At OX2R = 0.3 that is roughly 47% of baseline, which
+is what Kostansek et al. (2023) report for EMPA. build_latent_plan() keeps the
+baseline count instead, and is used where a mechanism has to be isolated from
+the rate effect.
 
-NEW IN v2.5.11 — OX-DEPENDENT EVENT COUNT (FIX L):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Where the inverted-U comes from
+-------------------------------
+Two library-borne effects set the ascending limb:
 
-  PROBLEM (v2.5.9):
-    build_replay_plan_ox() used n_spw from tr_bl (baseline trial) regardless
-    of OX2R level. This forced the same number of consolidation events at all
-    OX2R levels, discarding the most natural ascending-limb mechanism: reduced
-    SPW incidence at low OX2R.
+  (1) SPW incidence falls at low OX2R, to about 47% of baseline at 0.3
+  (2) SPW amplitude falls with it, so about 36% of events cross the induction
+      threshold at OX2R = 0.3 against about 94% at baseline
 
-    The SWR library (v5.8.3, parameterised by EMPA) already captures OX2R-
-    dependent SPW rate modulation: at OX2R=0.3, n_spw is ~47% of baseline
-    (Kostansek et al. 2023: EMPA reduced SPW incidence by ~50%). But v2.5.9
-    threw this away by always using baseline event count.
+Together they leave roughly 17% of baseline consolidation capacity at the
+bottom of the range. The descending limb is separate: replays truncate, the
+quality gate falls toward zero, and induction collapses with it. So
 
-    Consequence: the ascending limb was flat (DI(0.3→peak) = +0.003),
-    the inverted-U was pathologically asymmetric (ascending/descending ratio
-    = 0.07), and the complexity-dependent peak shift was weak (P(neg) = 0.836,
-    CI included zero).
+  low OX2R       few events, weak amplitudes, insufficient induction
+  intermediate   enough events of adequate quality and drive, peak induction
+  high OX2R      truncated replays, quality toward zero, induction lost
 
-  FIX L:
-    build_replay_plan_ox():  n_spw = tr_ox.get("n_spw", 0)   [was: tr_bl]
+The peak is the intersection of those two slopes. Longer sequences steepen
+only the descending limb, because the quality gate falls faster when the
+divergence step scales with sequence length, while the ascending limb depends
+on event count and amplitude and is sequence-length independent. The
+intersection therefore moves left as complexity rises.
 
-    One line changed. No new functions, no new parameters.
+Common random numbers
+---------------------
+struct_rng and noise_rng are seeded per (rep, ox) call. Event counts differ
+across OX2R levels, so plan sizes differ; the first min(n) events share the
+same draws, and levels with more events consume draws the sparser levels do
+not need. Common events stay aligned, which is what the paired comparisons
+rely on.
 
-  CONSEQUENCE:
-    The ascending limb now emerges from two mechanisms already in the library:
-      (1) Reduced SPW incidence at low OX2R (rate effect: ~47% of baseline)
-      (2) Reduced SPW amplitude at low OX2R (drive effect: ~36% of events
-          cross the induction threshold at OX2R=0.3 vs ~94% at baseline)
-    Combined effective consolidation capacity at OX2R=0.3: ~17% of baseline.
-
-    The inverted-U reflects a three-way balance:
-      Low OX2R:  fewer events + weaker amplitudes → insufficient induction
-      Optimal:   enough events with adequate quality × drive → peak induction
-      High OX2R: truncated replays → quality → 0 → zero induction
-
-    Complexity-dependent peak shift strengthens because the peak is now a
-    well-defined intersection of two real slopes. Longer sequences steepen
-    ONLY the descending limb (quality_gate drops faster when diverge_step
-    scales with seq_len); the ascending limb is seq_len-independent (driven
-    by event count and amplitude). The intersection shifts left with
-    complexity — geometrically forced.
-
-  CRN ALIGNMENT:
-    struct_rng and noise_rng are freshly seeded per (rep, ox) call via
-    np.random.RandomState(seed + offset). Different n_spw across OX levels
-    means different plan sizes. The first min(n) events share the same random
-    draws (correct CRN: common events are aligned). Additional events at
-    higher-rate levels consume draws the lower-rate level doesn't need.
-    This is the standard CRN pattern for varying-size experiments.
-
-  NOTE ON v2.6.0 OX1R AMPLITUDE MODULATION:
-    v2.6.0 added compute_ox1r_amp_mod() as a bolt-on to create the ascending
-    limb by scaling drive_gate amplitude. With FIX L, this is unnecessary:
-    the rate effect from the library is stronger and already grounded in
-    Kostansek data (EMPA SPW incidence reduction). The encoding gain pathway
-    (Pathway 1a, compute_encoding_gain) is RETAINED from v2.5.9 for the
-    encoding/consolidation dissociation analysis.
-
-  UNCHANGED FROM v2.5.9:
-    compute_encoding_gain(), compute_induction(), run_inhib_feedback()
-    build_latent_plan() — uses baseline n_spw (correct for mechanism-isolation)
-    consolidate(), encode(), all statistics, all ablation switches
-    All FIX A–K confirmed
-
-  CHANGES (minimal):
-    + build_replay_plan_ox(): n_spw from tr_ox (FIX L)
-    + Calibration check 0d: n_events by OX2R (verifies rate effect)
-    + Pickle saves FIX L metadata
-v2.5.11 fixes
-  EDIT 1   Frozen-LTP gate                    (fixes Fig 4C + the 2x2)
-  EDIT 2   Frozen-arm guard assertion          (stops this class of bug)
-  EDIT 3   Encoding-regime selection           (removes the knife edge)
-  EDIT 4   Complexity interaction test         (replaces censored vertex)
-  EDIT 5   Load sweep uses OX-specific plans   (resolves load/budget clas
-From
-METHODOLOGICAL STATUS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  All fixes A–K from v2.5.8 confirmed.
-  FIX L: OX-dependent event count — ascending limb emerges from
-  library data, no bolt-on functions needed.
-
-Uses: synthetic_libraries.pkl
+Encoding pathway
+----------------
+compute_encoding_gain() scales encoding by global orexinergic tone. It is
+independent of the consolidation-side machinery above, which is what makes the
+encoding/consolidation dissociation testable.
 """
 
 import numpy as np
-from scipy import stats
 from scipy.interpolate import interp1d
 from scipy.stats import spearmanr
 from pathlib import Path
 import pickle
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from dataclasses import dataclass
 import warnings
 warnings.filterwarnings('ignore')
 
-def ox_key(x):
-    return f"{x:.4f}".rstrip("0").rstrip(".")
+# ox_key lives in orexin_keys so the generator and the agent cannot disagree
+# about how an OX2R level becomes a library key.
 
 print("=" * 70)
-print("OREXIN-SWR-MEMORY AGENT MODEL (v2.5.11)")
-print("  BASE: v2.5.9 — FIX L: OX-dependent event count in replay plan")
+print("OREXIN-SWR-MEMORY AGENT MODEL")
+print("  Replay plans take their event count from the OX2R-specific trial")
 print("  Ascending limb emerges from library SPW rate + amplitude modulation")
-print("  No bolt-on functions; one structural line changed")
 print("=" * 70)
 print("Device: cpu (pure numpy)")
 
@@ -150,10 +117,10 @@ for p in [lib_path, cfg_path]:
     if not p.exists():
         raise FileNotFoundError(f"Not found: {p}")
 
-with open(lib_path, 'rb') as f:
-    SWP_LIBRARY = pickle.load(f)
-with open(cfg_path, 'rb') as f:
-    GEN_CONFIG = pickle.load(f)
+# Version-checked load: a library written by an older generator raises here
+# rather than producing a model whose parameters nothing else agrees with.
+SWP_LIBRARY = load_artifact('libraries')
+GEN_CONFIG = load_artifact('generator_config')
 
 print(f"Loaded library: {lib_path}")
 print(f"Library OX2R levels: {SWP_LIBRARY['orexin_levels']}")
@@ -306,17 +273,16 @@ def compute_ltp_gate(lag_ms, amp):
 def compute_encoding_gain(orexin_state, floor=1.0, amp=1.0, slope=1.5):
     """
     Monotonic saturating encoding gain from global orexin tone (OX1R-like).
-    Unchanged from v2.5.9.
     """
     return float(floor + amp * (1.0 - np.exp(-slope * float(orexin_state))))
 
-print(f"\nEncoding gain (v2.5.9 Pathway 1 — unchanged):")
+print(f"\nEncoding gain:")
 for _ox in [0.0, 0.3, 0.7, 1.0, 1.5, 1.8]:
     print(f"  orexin_state={_ox:.1f} → gain={compute_encoding_gain(_ox):.4f}")
 
 
 # =============================================================================
-# INDUCTION (FIX D+G+H — squared re-centred sigmoid, unchanged)
+# INDUCTION — squared re-centred sigmoid
 # =============================================================================
 INDUCTION_THETA = 0.20
 INDUCTION_TAU   = 0.05
@@ -325,8 +291,7 @@ INDUCTION_SIGMOID_BASELINE = float(1.0 / (1.0 + np.exp(INDUCTION_THETA / INDUCTI
 FROZEN_LTP_GATE = 0.414
 def compute_induction(quality_gate, ltp_gate):
     """
-    FIX D+G+H (v2.5.4): Squared re-centred sigmoid — C1-smooth onset.
-    Unchanged from v2.5.9.
+    Squared re-centred sigmoid, C1-smooth at onset.
     """
     signal = quality_gate * ltp_gate
     if signal < INDUCTION_THETA:
@@ -435,7 +400,7 @@ class LatentReplayPlan:
     noise_seed:  int
 
 def build_latent_plan(seq_len, feature_dim, struct_rng, noise_rng, trial_indices):
-    """Baseline replay plan — uses baseline n_spw. Unchanged from v2.5.9."""
+    """Baseline replay plan: uses the baseline n_spw at every OX2R level."""
     bl_trials = _get_trials(SWP_LIBRARY, MODEL_NAME_LIB, CONTEXT_LIB, 1.0)
     n_avail = len(bl_trials)
     if n_avail == 0:
@@ -485,17 +450,14 @@ def build_latent_plan(seq_len, feature_dim, struct_rng, noise_rng, trial_indices
 # =============================================================================
 def build_replay_plan_ox(ox2r, seq_len, feature_dim, struct_rng, noise_rng, trial_indices):
     """
-    FIX L: n_spw now comes from tr_ox (OX-specific trial), not tr_bl.
+    n_spw comes from tr_ox, the OX2R-specific trial, not from baseline.
 
     RATIONALE:
       EMPA (OX2R-selective antagonist) reduces SPW incidence by ~50% at full
       blockade (Kostansek et al. 2023). The library captures this: n_spw at
-      OX2R=0.3 is ~47% of baseline. v2.5.9 discarded this information by
-      forcing n_spw from baseline, eliminating the most natural ascending-limb
-      mechanism.
-
-    CHANGE (one line):
-      n_spw = int(tr_ox.get("n_spw", 0))     # was: tr_bl.get("n_spw", 0)
+      OX2R=0.3 is ~47% of baseline. Taking the count from the OX2R-specific
+      trial is what makes the ascending limb emerge from the library rather
+      than from a fitted term.
 
     EFFECT:
       At OX2R=0.3: ~47% fewer replay events → less consolidation → lower DI.
@@ -518,7 +480,7 @@ def build_replay_plan_ox(ox2r, seq_len, feature_dim, struct_rng, noise_rng, tria
     for idx in ti:
         tr_bl = bl_trials[int(idx) % n_bl]
         tr_ox = trials[int(idx) % n_avail]
-        # ─── FIX L: OX-specific SPW count ───────────────────
+        # ─── OX-specific SPW count ─────────────────────────
         n_spw = int(tr_ox.get("n_spw", 0))    # was: tr_bl.get("n_spw", 0)
         # ──────────────────────────────────────────────────────────────
         if n_spw == 0:
@@ -656,7 +618,9 @@ def apply_truncation(vector, n_steps, seq_len, dim, n_shared, gamma=None):
 class RateConsolidationAgent:
     """
     Memory consolidation agent.
-    Identical to v2.5.9 — FIX L is in build_replay_plan_ox(), not here.
+
+    The OX2R-dependent event count lives in build_replay_plan_ox(), not
+    here; this class consumes whatever plan it is handed.
     """
 
     def __init__(self, seq_len, feature_dim=16, dim=None, base_lr=0.3, seed=42):
@@ -1252,13 +1216,13 @@ def run_multi_memory_sweep(nm, task, oxs, nreps, diverge_idx=None, sw=CORE_SWITC
 
 
 # =============================================================================
-# CALIBRATION CHECK 0d: FIX L — EVENT COUNT BY OX2R
+# CALIBRATION CHECK: EVENT COUNT BY OX2R
 # =============================================================================
 print("\n" + "=" * 70)
-print("CALIBRATION CHECK 0d: FIX L — EVENT COUNT BY OX2R")
+print("CALIBRATION CHECK: EVENT COUNT BY OX2R")
 print("=" * 70)
 print("  Verifying: lower OX2R → fewer plan events (from library SPW rate)")
-print("  This is the ascending-limb mechanism — was discarded in v2.5.9")
+print("  This is the ascending-limb mechanism")
 
 _ref_check = _get_trials(SWP_LIBRARY, MODEL_NAME_LIB, CONTEXT_LIB, 1.0)
 _ti_check = _sample_crn(np.random.RandomState(123), N_TRIAL_BLOCKS, len(_ref_check))
@@ -1275,7 +1239,7 @@ for _ox in OX_MAIN:
     _mean_amp = float(np.mean(_ox_plan.spw_amp)) if _ox_plan.n_events > 0 else 0
     print(f"  {_ox:<6.2f} {_ox_plan.n_events:<15d} {_ratio:<15.3f} {_mean_amp:.0f}")
 print(f"  Baseline (latent_plan): {_bl_n} events")
-print(f"  FIX L: low OX2R → fewer events; high OX2R → ≈baseline")
+print(f"  low OX2R → fewer events; high OX2R → ≈baseline")
 
 
 # =============================================================================
@@ -1334,7 +1298,7 @@ def _calibrate_frozen_gate(n_probe=25):
 
 
 print("\n" + "=" * 70)
-print("CALIBRATION CHECK 0e: FROZEN-LTP GATE (v2.5.11)")
+print("CALIBRATION CHECK: FROZEN-LTP GATE")
 print("=" * 70)
 _measured_gate = _calibrate_frozen_gate()
 FROZEN_LTP_GATE = _measured_gate
@@ -1398,7 +1362,7 @@ for et in enc_trials_grid:
     nrm, nrs = _nr_bl(task, n_reps_prof); cm, cs = _c_bl(task, n_reps_prof); ben = cm - nrm
     prof.append({'et': et, 'nr': nrm, 'c': cm, 'benefit': ben})
     print(f"{et:<6}{nrm:.3f}+/-{nrs:.3f}  {cm:.3f}+/-{cs:.3f}  {ben:+.3f}  {'v' if nrm >= 0.15 else ''}")
-# v2.5.11: enc_trials is FIXED A PRIORI, not selected on the outcome measure.
+# enc_trials is FIXED A PRIORI, not selected on the outcome measure.
 # 10 presentations sits mid-grid, well below saturation (DI_no-replay = 0.055,
 # ~5% of the DI range), leaving consolidation free to move DI either way.
 # The full 3-20 grid is reported as a sensitivity analysis; curvature is
@@ -1590,8 +1554,11 @@ if frozen_mass_mean <= 1e-9:
         "INDUCTION_THETA, so this arm is a no-consolidation control and the "
         "reported LTP contribution is the whole consolidation effect."
     )
-_nc_di = float(np.mean(no_consol_da)) if 'no_consol_da' in dir() else None
-if _nc_di is not None:
+# The frozen arm has to sit somewhere between the full model and the
+# no-consolidation floor. If it lands on the floor it is not an intermediate
+# condition at all, and the limb decomposition below would be comparing the
+# full model against a relabelled control.
+if np.isfinite(ncm):
     _max_gap = max(abs(np.mean(frozen_da[ox]) - ncm) for ox in OX_MAIN)
     print(f"Frozen vs no-consolidation, max |gap|: {_max_gap:.4f}")
     if _max_gap < 1e-3:
@@ -1599,7 +1566,7 @@ if _nc_di is not None:
 ld = limb_decomposition(ox_da, frozen_da, OX_MAIN, split=1.0)
 
 print("\n" + "=" * 70)
-print("LIMB DECOMPOSITION (v2.5.11)")
+print("LIMB DECOMPOSITION")
 print("  Same split point (OX2R=1.0) for both arms")
 print("=" * 70)
 print(f"  {'':<12}{'full':<24}{'gate frozen':<24}{'difference'}")
@@ -1792,11 +1759,14 @@ ps = validate_peak_shift(cpx_pks, seq_lengths)
 print(f"\n  [descriptive] vertex slope={ps['slope_mean']:.4f} "
       f"[{ps['slope_ci_95'][0]:.4f},{ps['slope_ci_95'][1]:.4f}] P(neg)={ps['p_slope_negative']:.3f}")
 
-# v2.5.11 PRIMARY STATISTIC — censoring-free interaction test
+# PRIMARY STATISTIC — censoring-free interaction test
 ci_res = test_complexity_interaction(cpx_da, seq_lengths, OX_MAIN)
 print("\n  [primary] DI ~ OX + OX^2 + L + OX:L + OX^2:L   (L mean-centred)")
-for nm, mu, cc in zip(ci_res['beta_names'], ci_res['beta_mean'], ci_res['beta_ci_95']):
-    print(f"    {nm:<7} {mu:+.5f}  [{cc[0]:+.5f}, {cc[1]:+.5f}]")
+# NOTE: the loop variable is _bci, not cc. cc is the consolidation-regime
+# curvature dict from test_curvature() above; a bare `cc` here would silently
+# rebind it to a CI interval and write that into the results pickle.
+for nm, mu, _bci in zip(ci_res['beta_names'], ci_res['beta_mean'], ci_res['beta_ci_95']):
+    print(f"    {nm:<7} {mu:+.5f}  [{_bci[0]:+.5f}, {_bci[1]:+.5f}]")
 _q, _i, _sh = ci_res['quadratic'], ci_res['ox_by_length'], ci_res['implied_shift']
 print(f"\n    concavity  b2   = {_q['mean']:+.5f} [{_q['ci_95'][0]:+.5f},{_q['ci_95'][1]:+.5f}]  P(b2<0)={_q['p_neg']:.3f}")
 print(f"    OX x L     b4   = {_i['mean']:+.5f} [{_i['ci_95'][0]:+.5f},{_i['ci_95'][1]:+.5f}]  P(b4<0)={_i['p_neg']:.3f}")
@@ -1870,19 +1840,125 @@ for test_scale in [0.10, 0.15, 0.20, 0.30, 0.40]:
 CONSOL_LR_SCALE = saved_scale
 
 print("\n" + "=" * 70)
-print("ROBUSTNESS: INH PARAMETER SWEEP")
+print("MECHANISM SWEEP: E/I TERMINATION SLOPE (extended)")
 print("=" * 70)
-saved_k_slope = INH_K_SLOPE; saved_thr = INH_THRESHOLD; saved_e_decay = INH_E_DECAY
-inh_rob = {}
-for test_slope in [0.05, 0.06, 0.08, 0.10, 0.12]:
+
+K_SLOPE_GRID = [0.00, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12]
+K_SLOPE_PUBLISHED = [0.05, 0.06, 0.08, 0.10, 0.12]   # original grid, for provenance
+N_REPS_KSLOPE = 25
+
+saved_k_slope = INH_K_SLOPE
+saved_thr     = INH_THRESHOLD
+saved_e_decay = INH_E_DECAY
+
+# The quadratic fit is named test_curvature in some notebook revisions and
+# fit_quadratic in others. Resolve it rather than assuming.
+_quadfit = globals().get('fit_quadratic') or globals().get('test_curvature')
+if _quadfit is None:
+    raise NameError("Neither fit_quadratic nor test_curvature is defined. Run "
+                    "the statistics cell before this one.")
+
+inh_rob = {}          # rebuilt from scratch; thr_/edecay_ loops append to it below
+k_slope_ext = {}      # richer record, keyed by float
+
+print(f"\n  {'k_slope':>9}{'q2':>11}{'P(q2>=0)':>11}{'peak':>9}"
+      f"{'P(interior)':>13}{'p_prediv':>11}{'quality':>10}  note")
+print("  " + "-" * 86)
+
+for test_slope in K_SLOPE_GRID:
     INH_K_SLOPE = test_slope
-    r = run_paired_sweep(TaskConfig.MWM(divergence=TASK_DIVERGENCE), OX_COARSE, 25,
-                         sw=CORE_SWITCHES, diverge_idx=DIVERGE_IDX, encode_ox2r=1.0, use_ox_plans=True)
-    da = {ox: np.array([x['discrimination_index'] for x in r[ox]]) for ox in OX_COARSE}
-    c = test_curvature(OX_COARSE, da); pk = bootstrap_continuous_peak(da, OX_COARSE)
-    inh_rob[f'slope_{test_slope}'] = {'curvature': c['curvature'], 'peak': pk['mean']}
-    print(f"  k_slope={test_slope:.2f}: curv={c['curvature']:+.4f}, peak={pk['mean']:.2f}")
+
+    r = run_paired_sweep(TaskConfig.MWM(divergence=TASK_DIVERGENCE),
+                         OX_COARSE, N_REPS_KSLOPE,
+                         sw=CORE_SWITCHES, diverge_idx=DIVERGE_IDX,
+                         encode_ox2r=1.0, use_ox_plans=True)
+
+    da = {ox: np.array([x['discrimination_index'] for x in r[ox]])
+          for ox in OX_COARSE}
+
+    c   = _quadfit(OX_COARSE, da)
+    pk  = bootstrap_continuous_peak(da, OX_COARSE)
+    pl  = bootstrap_peak_location(da, OX_COARSE)
+
+    # Realized truncation, averaged over levels and replicates. This is the
+    # manipulation check: p_prediv is the fraction of events terminating at or
+    # before the divergence step, and mean_quality_gate is the surviving unique
+    # fraction. With truncation disabled the first must be 0 and the second 1.
+    # Non-conforming values mean the arm did not actually disable truncation.
+    _ppd = [np.nanmean([x.get('p_prediv', np.nan) for x in r[ox]])
+            for ox in OX_COARSE]
+    _qg  = [np.nanmean([x.get('mean_quality_gate', np.nan) for x in r[ox]])
+            for ox in OX_COARSE]
+    mean_trunc   = float(np.nanmean(_ppd))
+    mean_quality = float(np.nanmean(_qg))
+
+    rec = {
+        'curvature':    float(c['curvature']),
+        'sign_prob':    float(c['boot_sign_prob_nonneg']),
+        'peak':         float(pk['mean']),
+        'peak_ci':      [float(v) for v in pk['ci_95']],
+        'p_interior':   float(pl['p_interior']),
+        'mean_trunc':   mean_trunc,
+        'mean_quality': mean_quality,
+        'means':        {float(ox): float(np.mean(da[ox])) for ox in OX_COARSE},
+        'in_published_grid': test_slope in K_SLOPE_PUBLISHED,
+    }
+    k_slope_ext[float(test_slope)] = rec
+    inh_rob[f'slope_{test_slope}'] = {'curvature': rec['curvature'],
+                                      'peak':      rec['peak']}
+
+    if test_slope == 0.0:
+        note = "truncation OFF (control)"
+    elif test_slope == saved_k_slope:
+        note = "operating point"
+    elif test_slope not in K_SLOPE_PUBLISHED:
+        note = "new"
+    else:
+        note = ""
+
+    print(f"  {test_slope:>9.3f}{rec['curvature']:>+11.4f}{rec['sign_prob']:>11.4f}"
+          f"{rec['peak']:>9.3f}{rec['p_interior']:>13.3f}"
+          f"{mean_trunc:>11.4f}{mean_quality:>10.4f}  {note}")
+
 INH_K_SLOPE = saved_k_slope
+
+# ---- read the control directly ------------------------------------------
+_ctl = k_slope_ext[0.0]
+_op  = k_slope_ext[float(saved_k_slope)]
+
+print("\n  " + "-" * 86)
+print(f"  operating point k = {saved_k_slope:g}:  q2 = {_op['curvature']:+.4f}, "
+      f"peak = {_op['peak']:.3f}, P(interior) = {_op['p_interior']:.3f}")
+print(f"  truncation off  k = 0   :  q2 = {_ctl['curvature']:+.4f}, "
+      f"peak = {_ctl['peak']:.3f}, P(interior) = {_ctl['p_interior']:.3f}")
+
+_bad = (np.isfinite(_ctl['mean_trunc']) and _ctl['mean_trunc'] > 1e-9) or \
+       (np.isfinite(_ctl['mean_quality']) and _ctl['mean_quality'] < 1 - 1e-9)
+if _bad:
+    print(f"\n  WARNING: the k = 0 arm did not disable truncation.")
+    print(f"  p_prediv = {_ctl['mean_trunc']:.6f} (expected 0), "
+          f"quality gate = {_ctl['mean_quality']:.6f} (expected 1).")
+    print(f"  compute_k_inh returns INH_K_BASE + INH_K_SLOPE * ox; INH_K_BASE "
+          f"is currently {INH_K_BASE}.")
+    print("  If INH_K_BASE is non-zero the control is invalid - set it to 0 "
+          "for this arm.")
+elif _ctl['curvature'] >= 0 or _ctl['p_interior'] < 0.5:
+    print("\n  -> Removing OX2R-dependent termination removes the interior")
+    print("     optimum. The descending limb is produced by truncation.")
+    print("     This is the sentence the Discussion needs; quote these two")
+    print("     rows rather than the k = 0.05 row.")
+else:
+    print("\n  -> The interior optimum SURVIVES with truncation disabled")
+    print(f"     (q2 = {_ctl['curvature']:+.4f}, P(interior) = "
+          f"{_ctl['p_interior']:.3f}).")
+    print("     Something other than truncation produces the decline. Do not")
+    print("     write the truncation claim until this is understood: check")
+    print("     whether the replay plan or the budget still varies with OX2R")
+    print("     above baseline.")
+
+print("\n  Add to the results dict:  'k_slope_extended': k_slope_ext,")
+print("  ('inh_robustness' is rebuilt above and keeps its original key format.)")
+print("=" * 70)
 
 for test_thr in [0.15, 0.20, 0.25, 0.30, 0.40]:
     INH_THRESHOLD = test_thr
@@ -2077,7 +2153,7 @@ print(f"\nInternal consistency: {'ALL COHERENT' if _all_pass else 'CHECK NEEDED'
 # SMOKE TEST
 # =============================================================================
 print("\n" + "=" * 70)
-print("SMOKE TEST (v2.5.11)")
+print("SMOKE TEST")
 print("=" * 70)
 sma, smb = RateMemory.create_pair(16, 16, 0.3, TASK_DIVERGENCE, 0)
 _srt = _get_trials(SWP_LIBRARY, MODEL_NAME_LIB, CONTEXT_LIB, 1.0)
@@ -2097,16 +2173,16 @@ sc_neither = sag_n.consolidate(_spl, 1.0, NEITHER_SWITCHES, diverge_idx=DIVERGE_
 _nei_c   = p1_res['Neither']['curvature']
 _nei_u   = p1_res['Neither']['u_strength']
 fixdh_ok = abs(_nei_c) < 1e-3 and abs(_nei_u) < 1e-3
-print(f"  FIX D: Neither arm curv={_nei_c:+.6f}, U={_nei_u:+.6f} "
+print(f"  neither arm: curv={_nei_c:+.6f}, U={_nei_u:+.6f} "
       f"(flat expected) {'PASS' if fixdh_ok else 'FAIL'}")
 fixe_ok = sc2['mean_effective_cycles'] <= sc2['mean_cycles'] + 1e-6
-print(f"  FIX E: eff/raw={sc2['mean_effective_cycles']:.2f}/{sc2['mean_cycles']:.2f} {'PASS' if fixe_ok else 'FAIL'}")
+print(f"  budget: eff/raw={sc2['mean_effective_cycles']:.2f}/{sc2['mean_cycles']:.2f} {'PASS' if fixe_ok else 'FAIL'}")
 
-# FIX L verification
+# Event-count verification
 _pl_03 = build_replay_plan_ox(0.3, 16, 16, np.random.RandomState(123), np.random.RandomState(500), _sti)
 _pl_10 = build_replay_plan_ox(1.0, 16, 16, np.random.RandomState(123), np.random.RandomState(500), _sti)
 fixl_ok = _pl_03.n_events < _pl_10.n_events
-print(f"  FIX L: n_events(0.3)={_pl_03.n_events} < n_events(1.0)={_pl_10.n_events} {'PASS' if fixl_ok else 'FAIL'}")
+print(f"  event count: n(0.3)={_pl_03.n_events} < n(1.0)={_pl_10.n_events} {'PASS' if fixl_ok else 'FAIL'}")
 
 print(f"\n  {'ALL PASS' if fixdh_ok and fixe_ok and fixl_ok else 'PARTIAL FAIL'}")
 print("=" * 70)
@@ -2116,15 +2192,14 @@ print("=" * 70)
 # SUMMARY
 # =============================================================================
 print("\n" + "=" * 70)
-print("SUMMARY v2.5.11 — FIX L: OX-DEPENDENT EVENT COUNT")
+print("SUMMARY — OX-DEPENDENT EVENT COUNT")
 print("=" * 70)
 print(f"""
-LIBRARY: v5.8.3   ARCHITECTURE: RateReadout(dim={RATE_DIM})
+ARCHITECTURE: RateReadout(dim={RATE_DIM})
 
-FIX L (v2.5.11):
-  build_replay_plan_ox(): n_spw from tr_ox (OX-specific), not tr_bl (baseline).
-  Ascending limb emerges from library SPW rate + amplitude modulation.
-  No new functions or parameters. One structural line changed.
+REPLAY PLANS:
+  build_replay_plan_ox() takes n_spw from the OX2R-specific trial.
+  The ascending limb follows from library SPW rate and amplitude.
 
 THREE-WAY BALANCE (ascending limb + descending limb):
   Low OX2R:  fewer events (rate ↓{1-0.474:.0%}) + weaker drive (frac>θ ↓{1-0.364:.0%}) → low induction
@@ -2254,6 +2329,7 @@ with open(pkl_path, 'wb') as f:
         'consol_lr_robustness': clr_res,
         'induction_robustness': ind_rob,
         'inh_robustness':       inh_rob,
+        'k_slope_extended': k_slope_ext,
         'encoding_sensitivity': enc_sensitivity,
         'uniform_sampling_control': {'curvature': uc['curvature'], 'peak': up['mean']},
         'consistency_check': {
@@ -2282,258 +2358,291 @@ with open(pkl_path, 'wb') as f:
         },
         'main_mechanism_by_ox': main_mech_by_ox,
         'analysis_regimes': {
-            'main_experiment':       'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'consistency_check':     'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'frozen_ltp_gate':       'OX-specific replay plans (use_ox_plans=True, FIX L active)',
+            'main_experiment':       'OX-specific replay plans (use_ox_plans=True)',
+            'consistency_check':     'OX-specific replay plans (use_ox_plans=True)',
+            'frozen_ltp_gate':       'OX-specific replay plans (use_ox_plans=True)',
             'encoding_dissociation': 'OX-specific replay plans (use_ox_plans=True)',
-            'divergence_sweep':      'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'complexity_sweep':      'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'budget_sweep':          'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'supplement_supra':      'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'robustness_sweeps':     'OX-specific replay plans (use_ox_plans=True, FIX L active)',
-            'phase1_2x2':           'baseline latent-plan control (build_latent_plan — no FIX L)',
-            'phase2_modulators':    'baseline latent-plan control (build_latent_plan — no FIX L)',
-            'multi_memory':         'baseline latent-plan control (build_latent_plan — no FIX L)',
+            'divergence_sweep':      'OX-specific replay plans (use_ox_plans=True)',
+            'complexity_sweep':      'OX-specific replay plans (use_ox_plans=True)',
+            'budget_sweep':          'OX-specific replay plans (use_ox_plans=True)',
+            'supplement_supra':      'OX-specific replay plans (use_ox_plans=True)',
+            'robustness_sweeps':     'OX-specific replay plans (use_ox_plans=True)',
+            'phase1_2x2':           'baseline latent-plan control (build_latent_plan, baseline event count)',
+            'phase2_modulators':    'baseline latent-plan control (build_latent_plan, baseline event count)',
+            'multi_memory':         'baseline latent-plan control (build_latent_plan, baseline event count)',
         },
         'mechanism': {
-            'fix_L_ox_dependent_events': {
+            'ox_dependent_event_count': {
                 'description': 'build_replay_plan_ox uses tr_ox.n_spw (OX-specific) instead of tr_bl.n_spw (baseline)',
                 'effect': 'Ascending limb emerges from reduced SPW incidence at low OX2R',
                 'source': 'Kostansek et al. 2023 — EMPA reduces SPW incidence by ~50%',
                 'rate_ratio_at_0.3': 0.474,
             },
-            'fix_H_squared_induction': {
-                'description': 'Squared re-centred sigmoid induction (unchanged)',
+            'squared_sigmoid_induction': {
+                'description': 'Squared re-centred sigmoid induction',
                 'params': {'theta': INDUCTION_THETA, 'tau': INDUCTION_TAU, 'basal_floor': BASAL_LTP_FLOOR},
             },
-            'fix_E_proportional_budget': {
+            'proportional_budget': {
                 'description': 'effective_cycles = raw_cycles × (t_stop / seq_len)',
             },
         },
         'ltp_gate_params': {'lag0_ms': LAG0_MS, 'sigma_lag_ms': SIGMA_LAG_MS,
                             'theta_amp': THETA_AMP, 'temp_amp': TEMP_AMP,
                             'amp_norm_mean': AMP_NORM_MEAN, 'amp_norm_std': AMP_NORM_STD},
-        'version': VERSIONS['model'], 'library': 'v' + VERSIONS['generator'],
+        **stamp(),
     }, f)
 print(f"\nSaved: {pkl_path}")
 
-"""
-ASCENDING-LIMB DECOMPOSITION CONTROL  (v2.5.11c)
-=================================================================
-Question: does the ascending limb come from the OX-dependent EVENT COUNT
-(FIX L) or from the OX-dependent SPW AMPLITUDE?
 
-Design: 2x2 over the source of each library statistic.
-    count=ox,  amp=ox   -> reference arm, reproduces v2.5.11 main sweep
-    count=bl,  amp=ox   -> count contribution removed
-    count=ox,  amp=bl   -> amplitude contribution removed
-    count=bl,  amp=bl   -> both removed (expect flat ascending limb)
+# =============================================================================
+# TRUNCATION-OFF LIMB TEST
+# =============================================================================
 
-Cycles and coupling lags remain OX-specific in every arm; they drive
-truncation and belong to the descending limb, which serves here as a
-negative control (it should be unchanged across all four arms).
-
-REQUIRES the PLAN_SOURCE patch in build_replay_plan_ox().
-Run in the notebook after the model cell; reads no pickles.
-"""
-
-import numpy as np
-
-N_REPS   = 50          # match the main sweep
-N_BOOT   = 5000
-SEED     = 42
-LO, MID, HI = 0.3, 1.0, 1.8
-
-ARMS = [
-    ('count=ox  amp=ox', {'n_spw': 'ox', 'amp': 'ox'}),
-    ('count=bl  amp=ox', {'n_spw': 'bl', 'amp': 'ox'}),
-    ('count=ox  amp=bl', {'n_spw': 'ox', 'amp': 'bl'}),
-    ('count=bl  amp=bl', {'n_spw': 'bl', 'amp': 'bl'}),
-]
-
-# ── run the four arms ──────────────────────────────────────────────────────
-print("=" * 74)
-print("ASCENDING-LIMB DECOMPOSITION  (2x2 library-source control)")
-print("=" * 74)
-
-arm_da, arm_diag = {}, {}
-_saved = dict(PLAN_SOURCE)                                    # noqa: F821
-
-try:
-    for label, src in ARMS:
-        PLAN_SOURCE.update(src)                               # noqa: F821
-        res = run_paired_sweep(                               # noqa: F821
-            TaskConfig.MWM(divergence=TASK_DIVERGENCE),       # noqa: F821
-            OX_MAIN, N_REPS, sw=CORE_SWITCHES,                # noqa: F821
-            diverge_idx=DIVERGE_IDX, encode_ox2r=1.0,         # noqa: F821
-            use_ox_plans=True)
-        arm_da[label] = {ox: np.array([r['discrimination_index'] for r in res[ox]])
-                         for ox in OX_MAIN}                   # noqa: F821
-        arm_diag[label] = {
-            ox: (np.nanmean([r.get('n_plan_events', 0) for r in res[ox]]),
-                 np.nanmean([r.get('n_executed', 0) for r in res[ox]]),
-                 np.nanmean([r.get('mean_induction', 0) for r in res[ox]]))
-            for ox in OX_MAIN}                                # noqa: F821
-        print(f"  ran {label}")
-finally:
-    PLAN_SOURCE.update(_saved)                                # noqa: F821
-    print(f"  PLAN_SOURCE restored to {PLAN_SOURCE}")         # noqa: F821
-
-# ── paired bootstrap over replicate indices ────────────────────────────────
-def limbs(da, idx):
-    """Ascending and descending limb amplitudes for one resample."""
-    return (da[MID][idx].mean() - da[LO][idx].mean(),
-            da[HI][idx].mean() - da[MID][idx].mean())
-
-def summarise(v):
-    v = np.asarray(v)
-    return (float(v.mean()),
-            float(np.percentile(v, 2.5)),
-            float(np.percentile(v, 97.5)))
-
-rng = np.random.RandomState(SEED)
-nr  = len(arm_da[ARMS[0][0]][LO])
-draws = [rng.choice(nr, nr, True) for _ in range(N_BOOT)]     # shared -> paired
-
-boot = {lbl: {'asc': [], 'des': []} for lbl, _ in ARMS}
-for idx in draws:
-    for lbl, _ in ARMS:
-        a, d = limbs(arm_da[lbl], idx)
-        boot[lbl]['asc'].append(a)
-        boot[lbl]['des'].append(d)
-
-ref = ARMS[0][0]
-
-print("\n" + "-" * 74)
-print(f"{'arm':<18}{'ascending':<26}{'descending':<26}")
-print("-" * 74)
-for lbl, _ in ARMS:
-    am, alo, ahi = summarise(boot[lbl]['asc'])
-    dm, dlo, dhi = summarise(boot[lbl]['des'])
-    print(f"{lbl:<18}{am:+.4f} [{alo:+.4f},{ahi:+.4f}]  "
-          f"{dm:+.4f} [{dlo:+.4f},{dhi:+.4f}]")
-
-print("\n" + "-" * 74)
-print("DIFFERENCE vs reference arm (paired; CI excluding 0 = contribution)")
-print("-" * 74)
-for lbl, _ in ARMS[1:]:
-    da_ = np.asarray(boot[ref]['asc']) - np.asarray(boot[lbl]['asc'])
-    dd_ = np.asarray(boot[ref]['des']) - np.asarray(boot[lbl]['des'])
-    am, alo, ahi = summarise(da_)
-    dm, dlo, dhi = summarise(dd_)
-    p_a = float((da_ > 0).mean())
-    print(f"  {ref} minus {lbl}")
-    print(f"    ascending  {am:+.4f} [{alo:+.4f},{ahi:+.4f}]  P(>0)={p_a:.3f}")
-    print(f"    descending {dm:+.4f} [{dlo:+.4f},{dhi:+.4f}]   (expect ~0)")
-
-# ── diagnostic: did the plan size actually change, and did it bind? ────────
-print("\n" + "-" * 74)
-print("PLAN vs EXECUTED (binding check: count can only matter if n_plan <= n_exec)")
-print("-" * 74)
-print(f"{'OX2R':<7}" + "".join(f"{lbl.split()[0]:<22}" for lbl, _ in ARMS[:2]))
-print(f"{'':<7}" + "".join(f"{'n_plan  n_exec':<22}" for _ in ARMS[:2]))
-for ox in OX_MAIN:                                            # noqa: F821
-    row = f"{ox:<7.2f}"
-    for lbl, _ in ARMS[:2]:
-        npl, nex, _ = arm_diag[lbl][ox]
-        row += f"{npl:6.1f}  {nex:6.1f}        "
-    bind = "BINDS" if arm_diag[ref][ox][0] <= arm_diag[ref][ox][1] + 1 else ""
-    print(row + bind)
-
-print("\n" + "-" * 74)
-print("READING THE RESULT")
-print("-" * 74)
-print("  count=bl amp=ox  indistinguishable from reference")
-print("      -> event count contributes nothing; drop 'rate' from the")
-print("         ascending-limb mechanism sentence.")
-print("  count=ox amp=bl  ascending limb collapses toward zero")
-print("      -> amplitude-dependent drive is the ascending mechanism.")
-print("  descending limb unchanged in all arms")
-print("      -> confirms the decomposition is specific to the ascending limb.")
-
-"""
-DIAGNOSTIC: why does restoring the baseline EVENT COUNT raise DI at OX2R = 0.3
-when the amplitudes are still the low OX-specific ones?
-
-Run immediately after control_ascending_limb_decomposition.py, in the same
-session (reuses arm_diag / arm_da if present, otherwise re-runs the two arms
-that matter). Measures the executed-event population directly rather than the
-plan, since the budget rejects most planned events.
-"""
+# =============================================================================
+# TRUNCATION-OFF LIMB TEST
+#
+# Question: with E/I truncation disabled (k_slope = 0), does DI still DECLINE
+# from OX2R = 1.0 to 1.8?
+#
+# Why this test and not the quadratic: the k_slope sweep reports q2 < 0 and
+# P(interior) = 0.53 with truncation off. A curve that rises and then
+# plateaus also fits a negative quadratic term, with its vertex near the top
+# of the grid (peak 1.53 here), so the quadratic cannot tell saturation from a
+# real descending limb. The limb difference DI(1.8) - DI(1.0) can.
+#
+# Design: one extra sweep at k_slope = 0 with exactly the main-experiment
+# settings (OX_MAIN, nreps, CORE_SWITCHES, use_ox_plans=True). run_paired_sweep
+# seeds every replicate identically, so this arm and the main arm (ox_da) share
+# memories, replay plans and trial draws; only truncation differs. The limb
+# difference between arms is bootstrapped over replicates with the existing
+# limb_decomposition().
+#
+# Continues the run above, reusing run_paired_sweep, ox_da, OX_MAIN, nreps,
+# CORE_SWITCHES, DIVERGE_IDX, TASK_DIVERGENCE, limb_decomposition and
+# INH_K_SLOPE. Costs one main-sized sweep. The model is not modified;
+# INH_K_SLOPE is restored even if the sweep fails.
+# =============================================================================
+import pickle
+from pathlib import Path
 
 import numpy as np
 
-OX_PROBE = 0.3
-N_REPS_D = 20          # fewer reps: this is a mechanism probe, not a statistic
+_needed = ['run_paired_sweep', 'ox_da', 'OX_MAIN', 'nreps', 'CORE_SWITCHES',
+           'DIVERGE_IDX', 'TASK_DIVERGENCE', 'limb_decomposition', 'INH_K_SLOPE',
+           'TaskConfig']
+_missing = [n for n in _needed if n not in globals()]
+if _missing:
+    raise NameError(f"main experiment did not complete; missing: {_missing}")
+if sorted(ox_da) != sorted(OX_MAIN) or len(ox_da[1.0]) != nreps:
+    raise ValueError("ox_da does not match OX_MAIN / nreps from the main "
+                     "experiment; re-run this script from the top.")
 
-PROBE_ARMS = [
-    ('count=ox  amp=ox', {'n_spw': 'ox', 'amp': 'ox'}),
-    ('count=bl  amp=ox', {'n_spw': 'bl', 'amp': 'ox'}),
-]
+print("=" * 70)
+print("TRUNCATION-OFF LIMB TEST  (k_slope = 0 vs operating point)")
+print("=" * 70)
 
-print("=" * 78)
-print(f"EXECUTED-EVENT DIAGNOSTIC AT OX2R = {OX_PROBE}")
-print("=" * 78)
-
-_saved = dict(PLAN_SOURCE)                                        # noqa: F821
-rows = {}
-
+_k_op = INH_K_SLOPE
 try:
-    for label, src in PROBE_ARMS:
-        PLAN_SOURCE.update(src)                                   # noqa: F821
-        res = run_paired_sweep(                                   # noqa: F821
-            TaskConfig.MWM(divergence=TASK_DIVERGENCE),           # noqa: F821
-            [OX_PROBE], N_REPS_D, sw=CORE_SWITCHES,               # noqa: F821
-            diverge_idx=DIVERGE_IDX, encode_ox2r=1.0,             # noqa: F821
-            use_ox_plans=True)[OX_PROBE]
-
-        def m(key):
-            return float(np.nanmean([r.get(key, np.nan) for r in res]))
-
-        rows[label] = {
-            'DI':        m('discrimination_index'),
-            'n_plan':    m('n_plan_events'),
-            'n_exec':    m('n_executed'),
-            'n_budget':  m('n_budget_limited'),
-            'drive':     m('mean_signal'),
-            'ltp_gate':  m('mean_ltp_gate'),
-            'quality':   m('mean_quality_gate'),
-            'induction': m('mean_induction'),
-            'mass':      m('induction_mass'),
-            'eff_cyc':   m('mean_effective_cycles'),
-        }
+    INH_K_SLOPE = 0.0
+    _res_k0 = run_paired_sweep(TaskConfig.MWM(divergence=TASK_DIVERGENCE), OX_MAIN, nreps,
+                               sw=CORE_SWITCHES, diverge_idx=DIVERGE_IDX,
+                               encode_ox2r=1.0, use_ox_plans=True)
 finally:
-    PLAN_SOURCE.update(_saved)                                    # noqa: F821
+    INH_K_SLOPE = _k_op
 
-keys = ['DI', 'n_plan', 'n_exec', 'n_budget', 'eff_cyc',
-        'drive', 'ltp_gate', 'quality', 'induction', 'mass']
+k0_da = {ox: np.array([r['discrimination_index'] for r in _res_k0[ox]]) for ox in OX_MAIN}
 
-print(f"\n{'':<12}" + "".join(f"{lbl:<20}" for lbl, _ in PROBE_ARMS) + "delta")
-print("-" * 78)
-a, b = PROBE_ARMS[0][0], PROBE_ARMS[1][0]
-for k in keys:
-    va, vb = rows[a][k], rows[b][k]
-    print(f"{k:<12}{va:<20.4f}{vb:<20.4f}{vb - va:+.4f}")
+# Manipulation check: with truncation off, no event may end before the
+# divergence step and the surviving fraction must be 1.
+_ppd = np.nanmean([np.nanmean([r.get('p_prediv', np.nan) for r in _res_k0[ox]])
+                   for ox in OX_MAIN])
+_qg = np.nanmean([np.nanmean([r.get('mean_quality_gate', np.nan) for r in _res_k0[ox]])
+                  for ox in OX_MAIN])
+print(f"\n  manipulation check (k = 0): p_prediv = {_ppd:.4f} (expect 0), "
+      f"quality = {_qg:.4f} (expect 1)")
 
-print("\n" + "-" * 78)
-print("HOW TO READ IT")
-print("-" * 78)
-print("  induction_mass tracks DI (rho = 0.98 in your consistency check), so")
-print("  whichever row moves with mass is the channel.")
-print()
-print("  drive / ltp_gate move   -> executed events have HIGHER amplitudes than")
-print("                             the planned population; the larger plan is")
-print("                             changing WHICH events survive the budget,")
-print("                             not how many. Composition artifact.")
-print()
-print("  n_exec moves, gates flat-> the budget is not binding as tightly as the")
-print("                             plan/exec ratio suggested; count is real.")
-print()
-print("  mass moves, all else flat-> the effect is in per-event application")
-print("                             (memory selection via u_mem, or lr), not")
-print("                             in the gate. Check _build_cum_probs.")
-print()
-print("  NOTE: if 'drive' moves, the ascending limb is partly an artifact of")
-print("  plan construction order and must not be described as a rate effect")
-print("  OR an amplitude effect in the manuscript.")
+print(f"\n  {'OX2R':<7}{'DI, k = 0':<16}{'DI, k = ' + str(_k_op):<16}{'difference'}")
+print("  " + "-" * 50)
+for ox in OX_MAIN:
+    a, b = k0_da[ox].mean(), ox_da[ox].mean()
+    print(f"  {ox:<7.2f}{a:<16.4f}{b:<16.4f}{a - b:+.4f}")
 
+# limb_decomposition(first, second): *_full = first arm, *_froz = second arm,
+# *_diff = first - second. First = truncation off, second = operating point.
+ld0 = limb_decomposition(k0_da, ox_da, OX_MAIN, split=1.0)
+
+
+def _fmt(s):
+    return f"{s['mean']:+.4f} [{s['ci_95'][0]:+.4f}, {s['ci_95'][1]:+.4f}]"
+
+
+print(f"\n  {'':<12}{'truncation off':<28}{'operating point':<28}{'off - operating'}")
+for limb, k in [('ascending', 'asc'), ('descending', 'des')]:
+    print(f"  {limb:<12}{_fmt(ld0[k + '_full']):<28}{_fmt(ld0[k + '_froz']):<28}"
+          f"{_fmt(ld0[k + '_diff'])}")
+
+# ---- verdict --------------------------------------------------------------
+des0 = ld0['des_full']
+des_op = ld0['des_froz']
+lo, hi = des0['ci_95']
+print("\n  VERDICT")
+if lo > 0:
+    print(f"    Without truncation DI RISES from 1.0 to 1.8 ({_fmt(des0)}).")
+    print("    There is no descending limb; the k = 0 'interior optimum' is the")
+    print("    quadratic fitting a saturating curve. Truncation is the sole source")
+    print("    of the decline.")
+elif hi >= 0:
+    print(f"    Without truncation the 1.0 -> 1.8 change includes zero ({_fmt(des0)}).")
+    print("    No detectable descending limb; the k = 0 'interior optimum' is the")
+    print("    quadratic fitting a saturating curve. Truncation is the source of the")
+    print("    decline at the operating point.")
+else:
+    frac = des0['mean'] / des_op['mean'] if des_op['mean'] < 0 else np.nan
+    print(f"    DI still DECLINES without truncation ({_fmt(des0)}),")
+    print(f"    about {100 * frac:.0f}% of the decline at the operating point.")
+    print("    A second source shortens or weakens replay above OX2R = 1.0.")
+    print("    Do not attribute the descending limb to truncation alone; identify")
+    print("    that source first (check event count, amplitude and cycles in the")
+    print("    OX-specific replay plans above 1.0).")
+
+# ---- save ------------------------------------------------------------------
+_out = DIRS['results'] / 'truncation_off_limb_test.pkl'
+_out.parent.mkdir(parents=True, exist_ok=True)
+with open(_out, 'wb') as f:
+    pickle.dump({'k_slope_operating': _k_op, 'ox': OX_MAIN, 'nreps': nreps,
+                 'di_k0': {float(o): v for o, v in k0_da.items()},
+                 'di_operating': {float(o): v for o, v in ox_da.items()},
+                 'limbs': ld0, 'p_prediv_k0': float(_ppd), 'quality_k0': float(_qg)}, f)
+print(f"\n  saved: {_out}")
+print("=" * 70)
+
+
+# =============================================================================
+# ROBUSTNESS BATTERY AND ENCODING SENSITIVITY
+# =============================================================================
+
+# Read back what was just saved, so this section works on the
+# artefact rather than on whatever is still in scope above.
+D = load_artifact("results")
+
+def _curv(d):
+    return d.get('curvature', d) if isinstance(d, dict) else d
+
+print("="*68)
+print("ROBUSTNESS BATTERY — does the inverted-U survive perturbation?")
+print("  (curvature < 0 = peak preserved;  peak should stay interior ~1.0)")
+print("="*68)
+
+axes = [
+    ('inh_robustness',       'E/I truncation slope k_inh'),
+    ('induction_robustness', 'Induction threshold θ / τ'),
+    ('consol_lr_robustness', 'Consolidation learning rate'),
+    ('dimension_robustness', 'Readout dimension'),
+    ('gamma_robustness',     'Truncation gamma'),
+    ('divergence_results',   'Task divergence point'),
+]
+for key, label in axes:
+    if key not in D:
+        print(f"\n{label}: (not in pickle)"); continue
+    print(f"\n{label}  [{key}]")
+    for param, v in D[key].items():
+        c = _curv(v)
+        curv = c if np.isscalar(c) else c.get('curvature', np.nan)
+        peak = v.get('peak', np.nan) if isinstance(v, dict) else np.nan
+        peak = float(peak) if np.isscalar(peak) else np.nan
+        flag = "✓" if (np.isfinite(curv) and curv < 0) else "✗"
+        print(f"   {str(param):<12} curvature={curv:+.4f}  peak={peak:.3f}  {flag}")
+
+# headline curve for reference
+cc = D['consolidation_regime']['curvature']
+print("\n" + "-"*68)
+print(f"MAIN curve:    curvature={cc['curvature']:+.4f}  "
+      f"peak={D['consolidation_regime']['peak']['mean']:.3f}  "
+      f"p_interior={D['consolidation_regime']['p_interior']}")
+print(f"Peak shift:    slope={D['peak_shift']['slope_mean']:+.4f}  "
+      f"CI={[round(x,3) for x in D['peak_shift']['slope_ci_95']]}  "
+      f"p_neg={D['peak_shift']['p_slope_negative']}")
+
+# count how many perturbation conditions preserve the peak
+all_curv = []
+for key,_ in axes:
+    if key in D:
+        for v in D[key].values():
+            c = _curv(v)
+            cv = c if np.isscalar(c) else (c.get('curvature', np.nan) if isinstance(c,dict) else np.nan)
+            if np.isfinite(cv): all_curv.append(cv)
+n_neg = sum(c < 0 for c in all_curv)
+print("-"*68)
+print(f"OVERALL: {n_neg}/{len(all_curv)} perturbation conditions preserve "
+      f"negative curvature (inverted-U)")
+
+# =============================================================================
+# ENCODING-STRENGTH SENSITIVITY
+#   enc_trials lives inside TaskConfig → sweep via TaskConfig.MWM(enc_trials=et).
+#   test_curvature(oxs, da_dict)          ← da is the per-rep DICT, not means
+#   bootstrap_continuous_peak(da_dict, oxs)
+#
+# Continues the run above: uses run_paired_sweep, TaskConfig, test_curvature,
+#   bootstrap_continuous_peak, CORE_SWITCHES, DIVERGE_IDX and TASK_DIVERGENCE
+#   from this script, and D as loaded from the results pickle.
+# =============================================================================
+import numpy as np, pickle, shutil
+from pathlib import Path
+
+ENC_TRIALS_LIST = [3, 5, 8, 10, 15]
+N_REPS_ENC      = 30
+OX_GRID         = D['ox2r_levels']
+
+enc_sensitivity = {}
+print("="*66)
+print("ENCODING SENSITIVITY: does the inverted-U survive stronger encoding?")
+print("="*66)
+print(f"  {'enc_trials':<12}{'curvature':<12}{'p(non-neg)':<12}{'peak':<10}{'verdict'}")
+print("  " + "-"*60)
+
+for et in ENC_TRIALS_LIST:
+    # enc_trials set on the task; divergence matches the main consolidation curve
+    task = TaskConfig.MWM(divergence=TASK_DIVERGENCE, enc_trials=et)
+
+    res = run_paired_sweep(task, OX_GRID, N_REPS_ENC,
+                           sw=CORE_SWITCHES, diverge_idx=DIVERGE_IDX)
+
+    # per-rep DI arrays keyed by ox (this dict is what the analysis fns expect)
+    da = {ox: np.array([r['discrimination_index'] for r in res[ox]], float)
+          for ox in OX_GRID}
+
+    cv = test_curvature(np.array(OX_GRID), da)             # (oxs, da_dict)
+    pk = bootstrap_continuous_peak(da, np.array(OX_GRID))  # (da_dict, oxs)
+
+    curv = cv['curvature']
+    pnn  = cv.get('boot_sign_prob_nonneg', np.nan)
+    peak = pk['mean']
+    print(f"  {et:<12}{curv:<+12.4f}{pnn:<12.4f}{peak:<10.3f}"
+          f"{'✓ inverted-U' if curv < 0 else '✗ lost'}")
+
+    enc_sensitivity[et] = {
+        'curvature':              float(curv),
+        'boot_sign_prob_nonneg':  float(pnn),
+        'peak':                   float(peak),
+        'peak_ci':                [float(x) for x in pk['ci_95']],
+        'di_mean':                {float(ox): float(da[ox].mean()) for ox in OX_GRID},
+        'n_reps':                 N_REPS_ENC,
+    }
+
+n_neg = sum(v['curvature'] < 0 for v in enc_sensitivity.values())
+print("  " + "-"*60)
+print(f"  {n_neg}/{len(enc_sensitivity)} enc_trials regimes preserve the inverted-U")
+
+# ── save into the pickle (back up first) ──
+PKL = FILES['results']
+shutil.copy(PKL, PKL.with_suffix('.pkl.bak_enc'))
+D['encoding_sensitivity'] = enc_sensitivity
+with open(PKL, 'wb') as f:
+    pickle.dump(D, f)
+print(f"\n  Saved D['encoding_sensitivity'] → {PKL.name}")
+
+print("enc_trials   DI@peak(1.0-ish)   DI@0.3    DI@1.8    (floor rises, shape holds?)")
+for et in [3,5,8,10,15]:
+    dm = D['encoding_sensitivity'][et]['di_mean']
+    oxs = sorted(dm.keys())
+    print(f"  {et:<11}{dm[oxs[len(oxs)//2]]:<18.4f}{dm[oxs[0]]:<10.4f}{dm[oxs[-1]]:.4f}")

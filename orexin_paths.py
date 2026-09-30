@@ -1,29 +1,23 @@
 """
-orexin_paths.py — single source of truth for filesystem locations and for the
-version of every pipeline artefact.
-
-Filenames are version-free. The version lives inside each pickle instead, and
-is checked on load. This is strictly safer than encoding it in the filename:
-a filename mismatch is only caught if a human notices it, whereas
-`load_artifact()` raises.
+Filesystem locations and artefact identity for the pipeline.
 
 PROJECT_ROOT is $OREXIN_PROJECT_ROOT if set, otherwise the repository
 directory. Nothing else is consulted: no cloud storage, no notebook runtime,
 no machine-specific defaults. Working directories are created on demand and
 are git-ignored, so a fresh clone runs without configuration.
 
-To point the pipeline at data held elsewhere:
-
     export OREXIN_PROJECT_ROOT=/path/to/orexin_spw_r_project
 
-Usage
------
+Artefact filenames carry no version number. Each pickle is stamped with the
+pipeline version instead, and the stamp is checked on load, so a stale
+artefact raises rather than silently producing a figure from the wrong run.
+
     from orexin_paths import DIRS, FILES, load_artifact, stamp
 
-    D = load_artifact("results")        # version-checked on the way in
+    D = load_artifact("results")
 
     with open(FILES["results"], "wb") as f:
-        pickle.dump({**payload, **stamp("results")}, f)
+        pickle.dump({**payload, **stamp()}, f)
 """
 
 from __future__ import annotations
@@ -33,26 +27,26 @@ import pickle
 from pathlib import Path
 
 __all__ = [
-    "PROJECT_ROOT", "DIRS", "FILES", "VERSIONS",
-    "ensure_dirs", "find_file",
-    "load_artifact", "check_version", "stamp",
+    "PROJECT_ROOT", "DIRS", "FILES", "PIPELINE_VERSION",
+    "ensure_dirs", "find_file", "load_artifact", "check_version", "stamp",
 ]
 
 # --------------------------------------------------------------------------- #
-# Pipeline versions — the ONLY place these strings are written down
+# One version for the whole pipeline, bumped per release
 # --------------------------------------------------------------------------- #
 
-VERSIONS: dict[str, str] = {
-    "detector": "5.4.5",
-    "generator": "5.8.3",
-    "model": "2.5.11",
-}
+PIPELINE_VERSION = "2.6.0"
+
+_VERSION_FIELD = "pipeline_version"
 
 # --------------------------------------------------------------------------- #
-# Root resolution
+# Root
 # --------------------------------------------------------------------------- #
 
-_REPO_ROOT = Path(__file__).resolve().parent
+# Imported as a module this is the file's directory; pasted into a
+# notebook cell there is no __file__, so fall back to the working directory.
+_REPO_ROOT = (Path(__file__).resolve().parent
+              if "__file__" in globals() else Path.cwd().resolve())
 
 
 def _resolve_root() -> Path:
@@ -66,44 +60,36 @@ def _resolve_root() -> Path:
 PROJECT_ROOT: Path = _resolve_root()
 
 # --------------------------------------------------------------------------- #
-# Directory map
+# Directories
 # --------------------------------------------------------------------------- #
 
 DIRS: dict[str, Path] = {
     "root": PROJECT_ROOT,
-    "data_raw": PROJECT_ROOT / "data_raw",              # CRCNS LFP (never committed)
+    "data_raw": PROJECT_ROOT / "data_raw",              # recordings, never committed
     "data_processed": PROJECT_ROOT / "data_processed",  # detector output
-    "models": PROJECT_ROOT / "models",                  # synthetic libraries, configs
-    "results": PROJECT_ROOT / "results",                # simulation results
+    "models": PROJECT_ROOT / "models",                  # libraries and configs
+    "results": PROJECT_ROOT / "results",                # simulation output
     "figures": PROJECT_ROOT / "figures",                # publication figures
+    "tables": PROJECT_ROOT / "tables",                  # Table 1, supplements
     "checkpoints": PROJECT_ROOT / "checkpoints",        # agent checkpoints
-    "tables": PROJECT_ROOT / "tables",                  # Table 1, supplementary tables
 }
 
 # --------------------------------------------------------------------------- #
-# Artefact filenames — version-free
+# Artefacts
 # --------------------------------------------------------------------------- #
 
 FILES: dict[str, Path] = {
     "detector": DIRS["data_processed"] / "swr_detection.pkl",
     "libraries": DIRS["models"] / "synthetic_libraries.pkl",
     "generator_config": DIRS["models"] / "generator_config.pkl",
+    "validation_null": DIRS["models"] / "validation_null.pkl",
     "calibration_libraries": DIRS["models"] / "calibration_libraries.pkl",
     "results": DIRS["results"] / "agent_model_results.pkl",
 }
 
-# Backwards-compatible alias for the old key name.
-FILES["confirmed_results"] = FILES["results"]
-
-# Which key inside each pickle carries the version, and which VERSIONS entry it
-# must match. None = artefact carries no version stamp and is not checked.
-_VERSION_FIELD: dict[str, tuple[str, str] | None] = {
-    "detector": ("version", "detector"),
-    "libraries": ("generator_version", "generator"),
-    "generator_config": ("generator_version", "generator"),
-    "results": ("version", "model"),
-    "calibration_libraries": None,   # derived on demand, inherits generator version
-}
+# Artefacts whose version stamp is checked on load. The calibration libraries
+# are a cache regenerated on demand, so they carry no stamp.
+_CHECKED = {"detector", "libraries", "generator_config", "validation_null", "results"}
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -119,61 +105,48 @@ def ensure_dirs(verbose: bool = False) -> None:
 
 
 def find_file(filename: str) -> Path:
-    """Locate `filename` anywhere in the known directory tree."""
+    """Locate a file anywhere in the known directory tree."""
     for path in DIRS.values():
         candidate = path / filename
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        f"{filename!r} not found under {PROJECT_ROOT}. "
-        f"Set $OREXIN_PROJECT_ROOT or check that the artefact has been generated."
+        f"{filename!r} not found under {PROJECT_ROOT}. Set $OREXIN_PROJECT_ROOT, "
+        f"or check that the artefact has been generated."
     )
 
 
-def stamp(key: str) -> dict[str, str]:
+def stamp() -> dict[str, str]:
+    """Version field to merge into an artefact before pickling."""
+    return {_VERSION_FIELD: PIPELINE_VERSION}
+
+
+def check_version(key: str, payload, strict: bool = True) -> str | None:
     """
-    Version fields to merge into an artefact before pickling:
+    Verify the version stamped inside a loaded artefact.
 
-        pickle.dump({**payload, **stamp("results")}, f)
-
-    Guarantees the stamp matches what load_artifact() will check for.
+    Returns the version found, or None if this artefact is not version-checked.
+    Raises ValueError on a mismatch when strict.
     """
-    spec = _VERSION_FIELD.get(key)
-    if spec is None:
-        return {}
-    field, version_key = spec
-    return {field: VERSIONS[version_key]}
-
-
-def check_version(key: str, payload: dict, strict: bool = True) -> str | None:
-    """
-    Verify the version recorded inside a loaded artefact.
-
-    Returns the version string found, or None if the artefact is unversioned.
-    Raises ValueError on mismatch when strict.
-    """
-    spec = _VERSION_FIELD.get(key)
-    if spec is None:
+    if key not in _CHECKED:
         return None
-    field, version_key = spec
-    expected = VERSIONS[version_key]
-    found = payload.get(field) if isinstance(payload, dict) else None
+    found = payload.get(_VERSION_FIELD) if isinstance(payload, dict) else None
 
     if found is None:
         msg = (
-            f"{FILES[key].name} carries no {field!r} field. It was probably "
-            f"written by an older script. Regenerate it, or pass strict=False."
+            f"{FILES[key].name} carries no {_VERSION_FIELD!r} field. It predates "
+            f"this release. Regenerate it, or pass strict=False."
         )
         if strict:
             raise ValueError(msg)
         print(f"  [warn] {msg}")
         return None
 
-    if str(found) != expected:
+    if str(found) != PIPELINE_VERSION:
         msg = (
-            f"Version mismatch in {FILES[key].name}: file says {field}={found!r}, "
-            f"code expects {expected!r}. Regenerate the artefact, or update "
-            f"VERSIONS[{version_key!r}] in orexin_paths.py."
+            f"Version mismatch in {FILES[key].name}: file says {found!r}, code is "
+            f"{PIPELINE_VERSION!r}. Regenerate the artefact, or update "
+            f"PIPELINE_VERSION in orexin_paths.py."
         )
         if strict:
             raise ValueError(msg)
@@ -182,12 +155,11 @@ def check_version(key: str, payload: dict, strict: bool = True) -> str | None:
 
 
 def load_artifact(key: str, strict: bool = True) -> dict:
-    """Unpickle a named artefact and verify its recorded version."""
+    """Unpickle a named artefact and verify its version stamp."""
     path = FILES[key]
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found. Run the stage that produces it (see README), "
-            f"or fetch it from the Zenodo archive."
+            f"{path} not found. Run the stage that produces it; see the README."
         )
     with open(path, "rb") as f:
         payload = pickle.load(f)
@@ -199,13 +171,10 @@ if __name__ == "__main__":
     _src = ("$OREXIN_PROJECT_ROOT" if os.environ.get("OREXIN_PROJECT_ROOT")
             else "repository directory (default)")
     print(f"PROJECT_ROOT = {PROJECT_ROOT}")
-    print(f"  source: {_src}\n")
-    print("versions:")
-    for k, v in VERSIONS.items():
-        print(f"  {k:<12} {v}")
-    print("\nartefacts:")
-    for key in ("detector", "libraries", "generator_config",
-                "calibration_libraries", "results"):
+    print(f"  source: {_src}")
+    print(f"  pipeline version: {PIPELINE_VERSION}\n")
+    print("artefacts:")
+    for key in FILES:
         path = FILES[key]
         if not path.exists():
             print(f"  [MISSING] {key:<22} {path}")
@@ -214,7 +183,12 @@ if __name__ == "__main__":
             with open(path, "rb") as f:
                 payload = pickle.load(f)
             found = check_version(key, payload, strict=False)
-            tag = f"v{found}" if found else "unversioned"
+            if found:
+                tag = found
+            elif key in _CHECKED:
+                tag = "unstamped"
+            else:
+                tag = "not version-checked"
             print(f"  [ok     ] {key:<22} {path.name}  ({tag})")
         except Exception as e:  # noqa: BLE001
             print(f"  [ERROR  ] {key:<22} {path.name}: {type(e).__name__}: {e}")

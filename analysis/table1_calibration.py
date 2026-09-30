@@ -1,43 +1,43 @@
 """
-Table 1 — correspondence between reported antagonist effects, applied
-model multipliers, and realized synthetic library statistics.
+Table 1 - reported antagonist effects against realized library statistics.
 
 Reads:  models/calibration_libraries.pkl (generated on first run)
         models/synthetic_libraries.pkl (fallback)
 Writes: tables/table1_calibration.csv
         tables/table1_calibration.md
 
-Paths and artefact versions are resolved via orexin_paths.
+Uses dedicated high-n libraries with an independent seed. Skewed
+statistics are summarised by the median.
+
+Paths are resolved by orexin_paths; nothing here is machine-specific.
 """
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+def _repo_root() -> Path:
+    """Find the repository root whether this runs as a file or pasted in a cell."""
+    start = (Path(globals()["__file__"]).resolve().parent
+             if "__file__" in globals() else Path.cwd().resolve())
+    for d in (start, *start.parents):
+        if (d / "orexin_paths.py").exists():
+            return d
+    raise ImportError(
+        "orexin_paths.py not found above " + str(start) + ".\n"
+        "Running from a notebook? cd into the repository first, e.g.\n"
+        "    %cd /path/to/orexin-swr-consolidation")
 
-from common.paths import setup  # noqa: E402
 
-DIRS, FILES, PROJECT_ROOT, VERSIONS, load_artifact = setup()
+sys.path.insert(0, str(_repo_root()))
+
+from orexin_paths import DIRS, FILES, ensure_dirs  # noqa: E402
+from orexin_keys import ox_key  # noqa: E402,F401
+
+ensure_dirs()
 
 """
 Table 1 - Correspondence between reported antagonist effects, applied model
 multipliers, and realized synthetic library statistics.
-
-v3 changes vs v2
-----------------
-  * Uses dedicated high-n calibration libraries (n_trials=2000, independent
-    seed). Generates them on first run if the pickle is absent and the
-    generator objects are in the namespace. Falls back to the v5.8.3 library
-    with a warning if neither is available.
-  * Skewed continuous statistics (SPW amplitude, SPW duration, ripple
-    duration) are summarised by the MEDIAN, not the mean. A multiplicative
-    modulation scales the median exactly as it scales the mean, but the
-    median is not biased low by the right tail at finite n. Mean-based values
-    are still printed in the audit for comparison.
-  * Multi-ripple tendency row removed from the table (parameter is inert in
-    this library); an explicit inertness check is printed instead.
-  * Coupling-lag precision provenance reworded - it is unconstrained AND has
-    a realized dynamic range of a few percent, so it is not a robustness axis.
 
 Standalone. Needs no upstream state to build the table; only
 the optional library-generation step at the top uses `generator` and
@@ -55,11 +55,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-from common.utils import (  # noqa: E402
-    _mean_or_nan, _median_or_nan, _safe_np, _std_or_nan, ox_key,
-    pooled_p_couple, pooled_rate_per_min,
-)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -83,9 +78,8 @@ BOOT_SEED = 0
 
 DRUG_KEYS = ["sb_ox1r", "empa_ox2r", "dora"]
 
-# (ox_key, _safe_np, _mean_or_nan, _median_or_nan, _std_or_nan,
-#  pooled_rate_per_min, pooled_p_couple are imported from common.utils)
 
+# ox_key comes from orexin_keys (see header).
 
 # ---------------------------------------------------------------------------
 # Step 0 - obtain calibration libraries
@@ -132,9 +126,42 @@ def load_libraries():
 
 
 # ---------------------------------------------------------------------------
-# Pooling helpers  (generic ones live in common.utils: _safe_np, _mean_or_nan,
-# _median_or_nan, _std_or_nan, pooled_rate_per_min, pooled_p_couple)
+# Pooling helpers
 # ---------------------------------------------------------------------------
+def _safe_np(a):
+    return np.array(a) if a is not None else np.array([])
+
+
+def _mean_or_nan(x):
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.mean(a)) if len(a) else np.nan
+
+
+def _median_or_nan(x):
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if len(a) else np.nan
+
+
+def _std_or_nan(x):
+    a = np.asarray(x, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.std(a)) if len(a) > 1 else np.nan
+
+
+def pooled_rate_per_min(trials, count_key, duration_sec):
+    total = sum(int(t.get(count_key, 0)) for t in trials)
+    total_time = len(trials) * float(duration_sec)
+    return (total / total_time) * 60.0 if total_time > 0 else np.nan
+
+
+def pooled_p_couple(trials):
+    tot_spw = sum(int(t.get("n_spw", 0)) for t in trials)
+    tot_c = sum(int(t.get("n_spw_with_ripple", 0)) for t in trials)
+    return (tot_c / tot_spw) if tot_spw > 0 else np.nan
+
+
 def _concat_key(trials, key):
     parts = [_safe_np(t.get(key, [])) for t in trials]
     parts = [p for p in parts if len(p)]
@@ -436,4 +463,3 @@ if __name__ == "__main__":
     df = main()
     print()
     print(df.to_string(index=False))
-

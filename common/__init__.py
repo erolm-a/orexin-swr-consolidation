@@ -10,8 +10,8 @@ from . import paths, plotting, stats, utils
 from .paths import (  # noqa: F401
     DIRS,
     FILES,
+    PIPELINE_VERSION,
     PROJECT_ROOT,
-    VERSIONS,
     check_version,
     ensure_dirs,
     find_file,
@@ -52,7 +52,7 @@ from .utils import (  # noqa: F401
 )
 
 __all__ = [
-    "setup", "DIRS", "FILES", "PROJECT_ROOT", "VERSIONS",
+    "setup", "DIRS", "FILES", "PROJECT_ROOT", "PIPELINE_VERSION",
     "ensure_dirs", "load_artifact", "find_file", "stamp", "check_version",
     "plabel", "panel_label", "save_and_show",
     "test_curvature", "test_monotonicity", "bootstrap_continuous_peak",
