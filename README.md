@@ -10,7 +10,7 @@ OX2R-specific effects on SWR statistics shape replay and event-level plasticity.
 Consolidation-dominant learning yields a non-monotonic (band-pass) performance
 curve with an interior optimum whose location shifts with task complexity.
 
-Code accompanying: *[manuscript title]*, Shakleina and Trombetta, 2026. `[DOI or preprint link]`
+Code accompanying: A Computational Model Captures Orexin-Dependent Modulation of Memory Consolidation, Shakleina and Trombetta, 2026. 
 
 Note: the code has been largely co-written by AI models and manually tested on Linux systems (Ubuntu on Google Colab, NixOS 25.05) and using Python 3.11; while no OS-specific feature is used, we recommend running this code on similar platforms.
 
@@ -119,7 +119,7 @@ os.environ['OREXIN_PROJECT_ROOT'] = '/content/drive/MyDrive/orexin_spw_r_project
 ## Data availability
 
 Local field potentials come from the CRCNS `hc-11` dataset
-(Girardeau et al., 2017), NREM/Intermediate epochs of all POST sessions, along with their metadata.
+(Grosmark, Long & Buzsáki 2016), NREM/Intermediate epochs of all POST sessions, along with their metadata (Achilles, Buddy, Cicero, Gatsby).
 
 **These recordings are not redistributed here.** They must be downloaded from
 [crcns.org](https://crcns.org) under the CRCNS data-use terms and placed in
