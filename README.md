@@ -205,7 +205,8 @@ If you have an existing project directory with the old versioned filenames, run
 
 ## Citation
 
-See `CITATION.cff`.
+On GitHub, you can export the citation from the sidebar on the right in APA style or BibTex.
+See `CITATION.cff` for details.
 
 ## License
 

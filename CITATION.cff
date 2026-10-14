@@ -1,0 +1,42 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: orexin-swr-consolidation
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Polina
+    family-names: Shakleina
+    email: shakleina.polina.h11@kyoto-u.jp
+    affiliation: 'Graduate School of Biostudies, Kyoto University, Japan'
+    orcid: 'https://orcid.org/0009-0009-7470-7117'
+  - given-names: Adam
+    family-names: Guy
+    name-particle: Tsuda
+    orcid: 'https://orcid.org/0000-0002-8826-7433'
+    affiliation: >-
+      1 Graduate School of Biostudies, Kyoto University,
+      Japan
+  - given-names: Enrico Maria
+    family-names: Trombetta
+    affiliation: Graduate School of Information Science and Technology
+    orcid: 'https://orcid.org/0000-0001-5162-1059'
+identifiers:
+  - type: doi
+    value: 10.64898/2026.10.02.756298
+    description: Research Project
+repository-code: 'https://github.com/erolm-a/orexin-swr-consolidation'
+abstract: A model for OX2R encoding/consolidation
+keywords:
+  - orexin
+  - ox2r
+  - encoding and consolidation
+  - computational model
+  - plasticity
+license: MIT
+commit: ba2536d2eaa338c092c530c88e5337067cc696a2
+version: '1.0'
+date-released: '2026-10-03'
